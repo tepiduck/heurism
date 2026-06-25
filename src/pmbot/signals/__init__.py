@@ -1,0 +1,1 @@
+"""Signal research scaffolding."""
