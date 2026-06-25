@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
@@ -14,6 +14,7 @@ from pmbot.backtest.data import ReplayEvent, load_replay_events, merge_events
 from pmbot.backtest.models import (
     BookSnapshot,
     Fill,
+    MarkingMode,
     OrderRequest,
     OrderSide,
     OrderType,
@@ -37,8 +38,10 @@ class StrategyCallback(Protocol):
 class BacktestConfig:
     """Backtest execution realism configuration."""
 
-    latency_ms: int = 0
-    costs: CostConfig = CostConfig()
+    latency_ms: int = 150
+    costs: CostConfig = field(default_factory=CostConfig)
+    marking_mode: MarkingMode = MarkingMode.LIQUIDATION
+    allow_zero_costs: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +62,7 @@ class PointInTimeView:
     _trades: tuple[TradeEvent, ...]
     _events: tuple[ReplayEvent, ...]
     _gap_active_assets: frozenset[str]
+    _gap_active_all: bool
 
     def book(self, asset_id: str) -> BookSnapshot:
         """Return current book state as of ``ts_local_ns``."""
@@ -90,7 +94,7 @@ class PointInTimeView:
 
     def gap_active(self, asset_id: str) -> bool:
         """Return whether the asset is inside an untrusted gap span."""
-        return asset_id in self._gap_active_assets
+        return self._gap_active_all or asset_id in self._gap_active_assets
 
 
 class BacktestEngine:
@@ -99,6 +103,8 @@ class BacktestEngine:
     def __init__(self, config: BacktestConfig | None = None) -> None:
         self._config = config or BacktestConfig()
         self._cost_model = CostModel(self._config.costs)
+        if not self._config.allow_zero_costs and self._cost_model.is_zero_cost_schedule():
+            raise ValueError("zero-cost backtests require allow_zero_costs=True")
 
     def run_from_data_dir(self, data_dir: Path, strategy: StrategyCallback) -> BacktestResult:
         """Load WP-1 Parquet data and run a replay."""
@@ -106,7 +112,10 @@ class BacktestEngine:
 
     def run(self, events: Iterable[ReplayEvent], strategy: StrategyCallback) -> BacktestResult:
         """Run a deterministic event-driven replay."""
-        state = _ReplayState(cost_model=self._cost_model)
+        state = _ReplayState(
+            cost_model=self._cost_model,
+            marking_mode=self._config.marking_mode,
+        )
         replay_events = merge_events(events)
         index = 0
         while index < len(replay_events):
@@ -126,14 +135,15 @@ class BacktestEngine:
         return BacktestResult(
             blotter=tuple(state.fills),
             pnl_series=tuple(state.pnl_series),
-            pnl_valid=state.pnl_valid,
+            pnl_valid=all(mark.pnl_valid for mark in state.pnl_series),
         )
 
 
 class _ReplayState:
-    def __init__(self, *, cost_model: CostModel) -> None:
+    def __init__(self, *, cost_model: CostModel, marking_mode: MarkingMode) -> None:
         self.book = OrderBookState()
         self.cost_model = cost_model
+        self.marking_mode = marking_mode
         self.pending: list[PendingOrder] = []
         self.resting: list[RestingOrder] = []
         self.fills: list[Fill] = []
@@ -142,7 +152,6 @@ class _ReplayState:
         self.events: list[ReplayEvent] = []
         self.gap_assets: set[str] = set()
         self.gap_conditions: set[str] = set()
-        self.pnl_valid = True
         self.cash = Decimal("0")
         self.positions: dict[str, Decimal] = {}
         self._next_order_id = 1
@@ -183,6 +192,7 @@ class _ReplayState:
             _trades=tuple(self.trades),
             _events=tuple(self.events),
             _gap_active_assets=frozenset(self.gap_assets),
+            _gap_active_all=bool(self.gap_conditions),
         )
 
     def schedule_order(
@@ -209,10 +219,19 @@ class _ReplayState:
 
     def mark(self, ts_local_ns: int) -> None:
         """Record position and PnL state."""
-        marks = self.book.mid_prices()
         mtm = self.cash
+        mark_valid = True
         for asset_id, position in self.positions.items():
-            mtm += position * marks.get(asset_id, Decimal("0"))
+            if position == Decimal("0"):
+                continue
+            if self._gap_active(asset_id):
+                mark_valid = False
+            mark_price = self.book.mark_price(
+                asset_id=asset_id,
+                position=position,
+                mode=self.marking_mode,
+            )
+            mtm += position * (mark_price or Decimal("0"))
         self.pnl_series.append(
             PositionMark.create(
                 ts_local_ns=ts_local_ns,
@@ -220,7 +239,7 @@ class _ReplayState:
                 positions=self.positions,
                 mark_to_market=mtm,
                 pnl=mtm,
-                pnl_valid=self.pnl_valid,
+                pnl_valid=mark_valid,
             )
         )
 
@@ -339,7 +358,6 @@ class _ReplayState:
         )
 
     def _apply_gap(self, event: GapEvent) -> None:
-        self.pnl_valid = False
         if event.asset_id is None:
             self.gap_conditions.add(event.condition_id)
             self.resting = []

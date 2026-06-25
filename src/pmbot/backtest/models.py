@@ -25,6 +25,13 @@ class OrderType(StrEnum):
     MARKET = "market"
 
 
+class MarkingMode(StrEnum):
+    """Open-position mark-to-market policy."""
+
+    LIQUIDATION = "liquidation"
+    MID = "mid"
+
+
 @dataclass(frozen=True, slots=True)
 class OrderRequest:
     """Strategy order intent emitted at decision time."""

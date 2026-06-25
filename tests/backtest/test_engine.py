@@ -4,9 +4,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 
-from pmbot.backtest.costs import CostConfig, CostModel, LiquidityFlag
+import pytest
+
+from pmbot.backtest.costs import CostConfig, CostModel, FeeCategory, FeeVenue, LiquidityFlag
 from pmbot.backtest.engine import BacktestConfig, BacktestEngine, PointInTimeView
-from pmbot.backtest.models import OrderRequest, OrderSide, OrderType
+from pmbot.backtest.models import MarkingMode, OrderRequest, OrderSide, OrderType
 from pmbot.ingestion.recorder import ParquetRecorder
 from pmbot.ingestion.schemas import (
     BookEvent,
@@ -70,7 +72,7 @@ def test_no_phantom_fill_when_resting_price_never_trades_through() -> None:
         trade(BASE_TS + 1, price="0.60", size="100", taker_side="buy", trade_id="not-through"),
     ]
 
-    result = BacktestEngine().run(events, EmitOnce(order))
+    result = zero_cost_engine().run(events, EmitOnce(order))
 
     assert result.blotter == ()
 
@@ -88,7 +90,7 @@ def test_queue_realism_fills_only_after_ahead_volume_and_allows_partial() -> Non
         trade(BASE_TS + 2, price="0.50", size="45", taker_side="sell", trade_id="partial-fill"),
     ]
 
-    result = BacktestEngine().run(events, EmitOnce(order))
+    result = zero_cost_engine().run(events, EmitOnce(order))
 
     assert len(result.blotter) == 1
     fill = result.blotter[0]
@@ -114,7 +116,7 @@ def test_marketable_order_walks_depth_with_slippage_and_depth_cap() -> None:
         *delta(BASE_TS + 1, asks=[("0.52", "5")]),
     ]
 
-    result = BacktestEngine().run(events, EmitOnce(order))
+    result = zero_cost_engine().run(events, EmitOnce(order))
 
     assert [fill.size for fill in result.blotter] == [Decimal("5"), Decimal("5")]
     assert [fill.price for fill in result.blotter] == [Decimal("0.51"), Decimal("0.52")]
@@ -138,7 +140,7 @@ def test_latency_fills_against_arrival_book_not_decision_book() -> None:
         trade(BASE_TS + 10_000_000, price="0.70", size="1", taker_side="buy", trade_id="clock"),
     ]
 
-    result = BacktestEngine(BacktestConfig(latency_ms=10)).run(events, EmitOnce(order))
+    result = zero_cost_engine(latency_ms=10).run(events, EmitOnce(order))
 
     assert len(result.blotter) == 1
     assert result.blotter[0].price == Decimal("0.70")
@@ -147,8 +149,8 @@ def test_latency_fills_against_arrival_book_not_decision_book() -> None:
 
 def test_cost_parity_uses_shared_cost_model() -> None:
     config = CostConfig(
-        maker_fee_rate=Decimal("0.001"),
-        taker_fee_rate=Decimal("0.01"),
+        venue=FeeVenue.POLYMARKET_INTERNATIONAL,
+        category=FeeCategory.SPORTS,
         gas_per_fill=Decimal("0.02"),
     )
     order = OrderRequest(
@@ -162,7 +164,7 @@ def test_cost_parity_uses_shared_cost_model() -> None:
         trade(BASE_TS + 1, price="0.50", size="1", taker_side="buy", trade_id="clock"),
     ]
 
-    result = BacktestEngine(BacktestConfig(costs=config)).run(events, EmitOnce(order))
+    result = BacktestEngine(BacktestConfig(latency_ms=0, costs=config)).run(events, EmitOnce(order))
     fill = result.blotter[0]
     expected = CostModel(config).calculate(
         price=Decimal("0.50"),
@@ -171,12 +173,125 @@ def test_cost_parity_uses_shared_cost_model() -> None:
     )
 
     assert fill.notional == expected.notional
-    assert fill.fee == expected.fee
+    assert fill.fee == expected.fee == Decimal("0.07500")
     assert fill.gas == expected.gas
     assert fill.total_cost == expected.total
 
 
-def test_gap_span_blocks_fills_and_invalidates_pnl() -> None:
+def test_international_fee_curve_peaks_at_half_and_is_symmetric() -> None:
+    model = CostModel(
+        CostConfig(
+            venue=FeeVenue.POLYMARKET_INTERNATIONAL,
+            category=FeeCategory.SPORTS,
+        )
+    )
+
+    fee_30 = model.calculate(
+        price=Decimal("0.30"),
+        size=Decimal("100"),
+        liquidity=LiquidityFlag.TAKER,
+    ).fee
+    fee_50 = model.calculate(
+        price=Decimal("0.50"),
+        size=Decimal("100"),
+        liquidity=LiquidityFlag.TAKER,
+    ).fee
+    fee_70 = model.calculate(
+        price=Decimal("0.70"),
+        size=Decimal("100"),
+        liquidity=LiquidityFlag.TAKER,
+    ).fee
+
+    assert fee_50 == Decimal("0.75000")
+    assert fee_30 == fee_70 == Decimal("0.63000")
+    assert fee_50 > fee_30
+
+
+def test_maker_rebate_is_negative_cost() -> None:
+    model = CostModel(
+        CostConfig(
+            venue=FeeVenue.POLYMARKET_INTERNATIONAL,
+            category=FeeCategory.SPORTS,
+        )
+    )
+
+    cost = model.calculate(
+        price=Decimal("0.50"),
+        size=Decimal("100"),
+        liquidity=LiquidityFlag.MAKER,
+    )
+
+    assert cost.fee == Decimal("-0.18750")
+    assert cost.total < Decimal("0")
+
+
+def test_engine_refuses_zero_costs_without_explicit_opt_in() -> None:
+    with pytest.raises(ValueError, match="zero-cost backtests require allow_zero_costs=True"):
+        BacktestEngine(BacktestConfig(costs=CostConfig.zero()))
+
+
+def test_gap_span_blocks_fills_and_invalidates_pnl_for_held_position() -> None:
+    class GapStrategy:
+        def __call__(self, view: PointInTimeView) -> Iterable[OrderRequest]:
+            if view.ts_local_ns == BASE_TS:
+                return (
+                    OrderRequest(
+                        asset_id=ASSET_ID,
+                        side=OrderSide.BUY,
+                        size=Decimal("1"),
+                        order_type=OrderType.MARKET,
+                    ),
+                )
+            if view.ts_local_ns == BASE_TS + 1:
+                return (
+                    OrderRequest(
+                        asset_id=ASSET_ID,
+                        side=OrderSide.BUY,
+                        size=Decimal("10"),
+                        limit_price=Decimal("0.49"),
+                    ),
+                )
+            return ()
+
+    events = [
+        *snapshot(BASE_TS, bids=[("0.49", "20")], asks=[("0.50", "10")]),
+        trade(BASE_TS + 1, price="0.50", size="1", taker_side="buy", trade_id="clock"),
+        gap(BASE_TS + 2),
+        trade(BASE_TS + 3, price="0.49", size="100", taker_side="sell", trade_id="gap-trade"),
+    ]
+
+    result = zero_cost_engine().run(events, GapStrategy())
+
+    assert len(result.blotter) == 1
+    assert result.blotter[0].source_trade_id is None
+    assert result.pnl_valid is False
+    assert result.pnl_series[-1].pnl_valid is False
+
+
+def test_gap_recovery_restores_later_pnl_validity_after_fresh_snapshot() -> None:
+    order = OrderRequest(
+        asset_id=ASSET_ID,
+        side=OrderSide.BUY,
+        size=Decimal("1"),
+        order_type=OrderType.MARKET,
+    )
+    events = [
+        *snapshot(BASE_TS, bids=[("0.49", "20")], asks=[("0.50", "10")]),
+        trade(BASE_TS + 1, price="0.50", size="1", taker_side="buy", trade_id="clock"),
+        gap(BASE_TS + 2),
+        *snapshot(BASE_TS + 3, bids=[("0.48", "20")], asks=[("0.52", "10")]),
+        trade(BASE_TS + 4, price="0.52", size="1", taker_side="buy", trade_id="after-gap"),
+    ]
+
+    result = zero_cost_engine().run(events, EmitOnce(order))
+
+    invalid_marks = [mark for mark in result.pnl_series if not mark.pnl_valid]
+    assert invalid_marks
+    assert result.pnl_series[-1].pnl_valid is True
+    assert result.pnl_valid is False
+
+
+def test_liquidation_marking_values_long_below_mid_by_half_spread() -> None:
     order = OrderRequest(
         asset_id=ASSET_ID,
         side=OrderSide.BUY,
@@ -184,16 +299,21 @@ def test_gap_span_blocks_fills_and_invalidates_pnl() -> None:
         order_type=OrderType.MARKET,
     )
     events = [
-        *snapshot(BASE_TS, bids=[("0.49", "20")], asks=[("0.50", "10")]),
-        gap(BASE_TS + 1_000_000),
-        trade(BASE_TS + 2_000_000, price="0.50", size="10", taker_side="buy", trade_id="gap-trade"),
+        *snapshot(BASE_TS, bids=[("0.40", "20")], asks=[("0.60", "10")]),
+        trade(BASE_TS + 1, price="0.60", size="1", taker_side="buy", trade_id="clock"),
     ]
 
-    result = BacktestEngine(BacktestConfig(latency_ms=2)).run(events, EmitOnce(order))
+    liquidation = zero_cost_engine(marking_mode=MarkingMode.LIQUIDATION).run(
+        events,
+        EmitOnce(order),
+    )
+    mid = zero_cost_engine(marking_mode=MarkingMode.MID).run(events, EmitOnce(order))
 
-    assert result.blotter == ()
-    assert result.pnl_valid is False
-    assert result.pnl_series[-1].pnl_valid is False
+    assert liquidation.pnl_series[-1].mark_to_market == Decimal("-2.00")
+    assert mid.pnl_series[-1].mark_to_market == Decimal("-1.00")
+    assert mid.pnl_series[-1].mark_to_market - liquidation.pnl_series[-1].mark_to_market == Decimal(
+        "1.00"
+    )
 
 
 def test_deterministic_replay_produces_identical_blotters() -> None:
@@ -208,8 +328,8 @@ def test_deterministic_replay_produces_identical_blotters() -> None:
         trade(BASE_TS + 1, price="0.51", size="1", taker_side="buy", trade_id="clock"),
     ]
 
-    first = BacktestEngine().run(events, EmitOnce(order))
-    second = BacktestEngine().run(events, EmitOnce(order))
+    first = zero_cost_engine().run(events, EmitOnce(order))
+    second = zero_cost_engine().run(events, EmitOnce(order))
 
     assert first.blotter == second.blotter
 
@@ -229,7 +349,7 @@ def test_replay_from_parquet_fixture_outputs_blotter_and_pnl(tmp_path) -> None:
         order_type=OrderType.MARKET,
     )
 
-    result = BacktestEngine().run_from_data_dir(tmp_path, EmitOnce(order))
+    result = zero_cost_engine().run_from_data_dir(tmp_path, EmitOnce(order))
 
     assert len(result.blotter) == 1
     assert result.blotter[0].price == Decimal("0.51")
@@ -317,4 +437,19 @@ def gap(ts: int) -> GapEvent:
         reason=GapReason.CONNECTION_LOST,
         details="fixture gap",
         seq_or_hash=None,
+    )
+
+
+def zero_cost_engine(
+    *,
+    latency_ms: int = 0,
+    marking_mode: MarkingMode = MarkingMode.LIQUIDATION,
+) -> BacktestEngine:
+    return BacktestEngine(
+        BacktestConfig(
+            latency_ms=latency_ms,
+            costs=CostConfig.zero(),
+            marking_mode=marking_mode,
+            allow_zero_costs=True,
+        )
     )

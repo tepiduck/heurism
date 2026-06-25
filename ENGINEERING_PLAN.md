@@ -47,10 +47,14 @@ ingestion (CLOB websocket + Gamma REST)
 - **WP-1 — Ingestion + recorder:** websocket L2 book + trades + Gamma metadata → Parquet, with reconnect/gap-detection. Venue-agnostic recorder so a sharper reference venue can plug in later. ← CURRENT
 - **WP-2 — Backtester:** event-driven replay over recorded data; realistic fills, **fees + gas**, configurable latency. Every downstream metric is meaningless without correct cost modeling.
 - **WP-3 — Feature library + first signal:** OBI, microprice, spread, depth. **First signal is cross-venue deviation** (Polymarket vs a sharper reference), blended on the **log-odds scale + extremizing**, with a **double-counting guard** (update only on the orthogonal/private component). OBI→drift is research-only, expected to fail net of fees. *(Corrected from v1, which led with OBI.)*
-- **WP-4 — Eval:** **primary = proper scoring rules (Brier, log-loss) over many resolved markets + calibration curves + implementation shortfall.** Cross-venue CLV is a **secondary** diagnostic only (no sharp close on Polymarket; inefficiency rises near resolution). *(Corrected from v1, which made CLV primary.)*
-- **WP-5 — Risk + sizing:** **fractional Kelly (≤¼ haircut), simultaneous/vector Kelly with covariance, opportunity-cost-adjusted edge for locked capital**, per-market & aggregate position limits, capacity cap, correlation cap, drawdown kill-switch.
+- **WP-4 — Eval + calibration:** ← CURRENT. **primary = proper scoring rules (Brier, log-loss) over many resolved markets vs the market-price baseline + calibration curves + implementation shortfall.** ALSO calibrates the WP-3 magic constants (`double_counting_overlap`, confidence scalar) via train/test sweep. Cross-venue CLV is a **secondary** diagnostic only. *(Corrected from v1, which made CLV primary.)*
+- **WP-5 — Risk + sizing:** **fractional Kelly (≤¼ haircut), simultaneous/vector Kelly with covariance, opportunity-cost-adjusted edge for locked capital**, per-market & aggregate position limits, capacity cap, correlation cap, drawdown kill-switch. **HARD RULE: WP-5 must not run before WP-4 — sizing on uncalibrated signal magnitude is the overbetting failure mode. WP-4 gates WP-5.**
 - **WP-6 — Execution layer:** ← FAST-TRACKED, builds in parallel with WP-2. CLOB order signing/placement; `paper` and `live` adapters behind one interface. `live` enabled by `MODE=live LIVE=1`. Built so that the moment the signal validates, the trade path is already done — owner funds the wallet and flips the switch.
 - **WP-7 — Live loop + monitoring:** orchestrate ingest→signal→size→execute; logging, alerting, heartbeat, panic-flatten.
+- **WP-8 — Cross-market arbitrage (penciled, AFTER single-leg validates):** true dual-leg arb over verified contract pairs (buy YES cheap venue + NO dear venue for combined cost <$1). Builds on the WP-3 mapper + a dual-venue executor extending WP-6. Deferred: most-competed, fee-hostile near p=0.5, and intensifies the US-geofencing legal exposure (requires trading both Kalshi + Polymarket as a US person). Do not build until the cross-venue single-leg signal is shown to pay in WP-4.
+
+### WP-3 status: ✅ implemented, with one required fix
+Cross-venue signal + feature lib + conservative mapper done. **Required fix before trusting it: the mapper has NO YES/NO polarity check** — mapping PM-YES to an oppositely-defined Kalshi-YES flips the signal sign and trades backwards with full confidence. See fix below. Also flagged for WP-4 to calibrate: `double_counting_overlap=0.5` (hardcoded; collapses the guard to an equal-weight log-odds average), the `confidence = |signal|×4×freshness` scalar, and the "Kalshi leads" guard which is currently a freshness filter, not true lead-lag.
 
 **Rule for Codex on every WP:** ship tests, type hints, and a runnable `make`/CLI entrypoint. No WP is "done" until its acceptance criteria pass and tests are green.
 
@@ -232,3 +236,59 @@ Chosen over Betfair/Pinnacle because: US-legal official API (Betfair blocks US p
 > - look-ahead guard: future data is provably ignored.
 >
 > **Acceptance:** `make lint typecheck test` green; signal runs over recorded data via the WP-2 backtester; print the look-ahead test and a sample signal output. Do not start WP-5 wiring until reviewed.
+
+---
+
+## Mapper polarity fix (do first — small, prevents wrong-way trades; paste to Codex)
+
+> **Task:** Harden the contract mapper against YES/NO polarity inversion in `src/pmbot/signals/contracts.py`. Currently a Polymarket YES token can be mapped to an oppositely-defined Kalshi YES, flipping the signal sign and trading backwards.
+> - Add an explicit `polarity` / orientation to `ContractMetadata` and `ManualAllowlistEntry` describing what the priced YES token pays out on (the resolution condition in normalized form), for BOTH venues.
+> - `verify_pair` must REJECT unless the two YES definitions denote the same outcome direction. If a venue's comparable token is the opposite side, require the allowlist entry to specify an explicit `invert=True` mapping (so the signal can flip Kalshi's probability to 1−p before pooling), and thread that inversion through to the signal.
+> - `CrossVenueSignal` must apply the verified inversion (use `1 − kalshi_probability` when the pair is inverted) BEFORE the log-odds pool.
+> - Tests: a same-direction pair verifies; an opposite-direction pair without `invert` is rejected; an `invert=True` pair produces a correctly sign-flipped signal vs the non-inverted case.
+> **Acceptance:** `make lint typecheck test` green; show the inversion test.
+
+---
+
+## WP-4 — Eval + calibration (paste to Codex after the polarity fix)
+
+> **Task:** Implement WP-4 — evaluation + calibration. This is the instrument that decides whether the signal has real edge and converts WP-3's guessed constants into validated numbers. Stay in a new `src/pmbot/eval/`. Build/test on fixtures now; real verdict comes once live resolved-market data exists.
+>
+> **Inputs:** backtest results (blotter, pnl_series) from WP-2; signal forecasts `p̂` at decision times from WP-3; realized binary market outcomes (resolutions) from Gamma/Kalshi metadata.
+>
+> **Components:**
+> 1. **Proper scoring:** Brier score + log-loss of `p̂` vs realized outcomes across resolved markets. Compute the SAME scores for the Polymarket microprice as a baseline forecast. **Headline metric = Brier skill of `p̂` over the market price.** If `p̂` does not beat the market's own Brier, there is no alpha — report this front and center.
+> 2. **Calibration:** reliability curve (bin `p̂` vs empirical frequency) + Expected Calibration Error, with bootstrap confidence bands; flag small-n loudly.
+> 3. **PnL metrics:** total PnL, Sharpe, max drawdown, hit rate — computed ONLY over `pnl_valid` spans (respect WP-2's scoped gap invalidation).
+> 4. **Implementation shortfall:** per fill, arrival-mid (decision price) vs actual fill price → execution cost; aggregate. Decompose total PnL into `alpha (p̂ beat market) + execution (fills beat arrival mid) + noise`.
+> 5. **Constant calibration (replaces WP-3 guesses):** grid-sweep `double_counting_overlap` and the confidence scalar; select the value maximizing **out-of-sample** Brier-skill / PnL on a train split, validate on a held-out split. Report in-sample vs out-of-sample gap. NO LEAKAGE: the test split must use the train-selected param; add a test asserting no peeking. Walk-forward if feasible.
+> 6. **Secondary — cross-venue CLV:** entry price vs Kalshi's later price; report as a noisy diagnostic, not a headline.
+> 7. **Significance + sample size:** bootstrap CIs on Brier-skill and PnL; report n resolved markets; explicitly flag when n is too small to conclude (it will be, early).
+>
+> **Tests (fixtures):** Brier/log-loss vs hand-computed; calibration binning; market-baseline comparison; implementation-shortfall decomposition; sweep has no train/test leakage.
+>
+> **Acceptance:** `make lint typecheck test` green; produce a sample eval report over a fixture showing Brier-skill vs market, calibration data, PnL/Sharpe/DD, implementation shortfall, and the chosen overlap/confidence with the in/out-of-sample gap. **WP-4 gates WP-5 — do not start sizing until this is reviewed and the signal shows positive out-of-sample Brier-skill.**
+
+**Reality note:** WP-4 machinery can be built/tested on fixtures now, but a real edge verdict needs live recorded + resolved data — still blocked by the SWG/parser-probation item. The calibration is only as trustworthy as the data feeding it.
+
+---
+
+## WP-7a — Data-collection runner (paste to Codex; deploy on the home MacBook)
+
+> **Task:** Implement a persistent, unattended data-collection runner — WP-7 minus all trading. Its job: record Polymarket + Kalshi market data continuously, log every signal `p̂` with timestamps, and collect market resolutions, so WP-4 can later score real out-of-sample Brier skill. NO orders, no execution, read-only. Add `src/pmbot/runner/` and CLI wiring.
+>
+> **Components:**
+> 1. **Orchestrator:** run Polymarket (CLOB ws + Gamma) and Kalshi ingestion concurrently, feeding the existing venue-agnostic recorder. One process, supervised async tasks; if one venue's stream dies, it reconnects (WP-1 backoff) without killing the other.
+> 2. **Signal logging (critical for WP-4):** for each verified contract pair, compute the cross-venue `SignalValue` on each update and persist it to a `signals/` Parquet stream with `ts_local_ns`, `p̂`, both venue probabilities, direction, confidence. This prediction history is what gets joined to resolutions to score Brier — without it there is no verdict.
+> 3. **Resolution poller:** periodically (configurable, e.g. every 15 min) query Gamma + Kalshi for resolved outcomes of tracked markets; persist outcome labels (`condition_id`/`ticker`, resolved_outcome, resolved_at) to a `resolutions/` stream. Idempotent; never double-record.
+> 4. **Verified-pair allowlist:** load the curated allowlist (the human-maintained set of short-horizon Polymarket↔Kalshi pairs); only track + signal those pairs.
+> 5. **Observability:** structured heartbeat log (per-venue last-frame time, frames/min, reconnects, gaps in last hour); a `pmbot status` CLI showing uptime, per-venue freshness, n pairs tracked, n resolutions collected, gap count last 24h.
+> 6. **macOS unattended operation:** ship a `launchd` plist (KeepAlive=true so it auto-restarts on crash/reboot) and document running under `caffeinate -i` (or the plist equivalent) to prevent sleep. Document: disable system sleep, "prevent sleep on lid close", keep plugged in.
+>
+> **Robustness:** survive network blips, venue restarts, and process restarts without data loss beyond the gap (mark gaps, never silently drop). Flush Parquet frequently so a hard kill loses < 1 min.
+>
+> **Tests (CI, no live network):** orchestrator restarts a failed venue task without stopping the other; signal-logging writes the expected Parquet schema; resolution poller is idempotent (same resolution twice → one record); `status` renders from fixture state.
+>
+> **Acceptance:** `make lint typecheck test` green. Manual (on the off-SWG MacBook): `pmbot run-collector --allowlist <file>` records book+trade+signal+resolution Parquet and `pmbot status` shows live freshness. Include the launchd plist + a short "run 24/7 on macOS" README section. No orders anywhere.
+
+**Parallel human task:** curate the verified-pair allowlist — short-horizon (daily/hourly) markets that exist on BOTH Polymarket and Kalshi and resolve within the recording window, with verified matching YES-payout polarity. This is manual and gates how many pairs the runner can track.

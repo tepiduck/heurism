@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections.abc import Iterable
 from decimal import Decimal
 
-from pmbot.backtest.models import BookLevel, BookSnapshot, OrderRequest, OrderSide, OrderType
+from pmbot.backtest.models import (
+    BookLevel,
+    BookSnapshot,
+    MarkingMode,
+    OrderRequest,
+    OrderSide,
+    OrderType,
+)
 from pmbot.ingestion.schemas import BookEvent, BookEventType, BookSide
 
 
@@ -82,6 +89,27 @@ class OrderBookState:
             if snapshot.best_bid is not None and snapshot.best_ask is not None:
                 marks[asset_id] = (snapshot.best_bid.price + snapshot.best_ask.price) / Decimal("2")
         return marks
+
+    def mark_price(
+        self,
+        *,
+        asset_id: str,
+        position: Decimal,
+        mode: MarkingMode,
+    ) -> Decimal | None:
+        """Return the conservative mark for an open position."""
+        snapshot = self.snapshot(asset_id)
+        if mode == MarkingMode.MID:
+            if snapshot.best_bid is None or snapshot.best_ask is None:
+                return None
+            return (snapshot.best_bid.price + snapshot.best_ask.price) / Decimal("2")
+        if mode == MarkingMode.LIQUIDATION:
+            if position > Decimal("0"):
+                return snapshot.best_bid.price if snapshot.best_bid is not None else None
+            if position < Decimal("0"):
+                return snapshot.best_ask.price if snapshot.best_ask is not None else None
+            return Decimal("0")
+        raise ValueError(f"unsupported marking mode: {mode}")
 
     def _walkable_levels(self, order: OrderRequest) -> Iterable[BookLevel]:
         snapshot = self.snapshot(order.asset_id)
