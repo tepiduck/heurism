@@ -23,6 +23,7 @@ from pmbot.ingestion.kalshi import (
     KALSHI_WS_URL,
     KalshiMetadataClient,
     KalshiRecorderAdapter,
+    kalshi_ssl_context,
     kalshi_subscribe_message,
 )
 from pmbot.runner.allowlist import load_verified_pairs
@@ -168,7 +169,11 @@ class KalshiVenueTask:
                 json.loads((await self._metadata.fetch_market(pair.kalshi_ticker)).raw_json)
             )
         self._adapter.flush_all()
-        async with connect(self._ws_url, ping_interval=20.0) as websocket:
+        async with connect(
+            self._ws_url,
+            ping_interval=20.0,
+            ssl=kalshi_ssl_context(),
+        ) as websocket:
             await websocket.send(
                 json.dumps(
                     kalshi_subscribe_message(

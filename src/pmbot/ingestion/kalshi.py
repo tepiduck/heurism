@@ -7,12 +7,14 @@ asset, NO bids imply YES asks at ``1 - no_bid`` with the same size.
 from __future__ import annotations
 
 import json
+import ssl
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import cast
 
+import certifi
 import httpx
 
 from pmbot.ingestion.parsers import parse_decimal
@@ -437,6 +439,11 @@ def kalshi_subscribe_message(
             "market_tickers": list(market_tickers),
         },
     }
+
+
+def kalshi_ssl_context() -> ssl.SSLContext:
+    """Build a websocket SSL context from certifi's CA bundle."""
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 class _ClientContext:

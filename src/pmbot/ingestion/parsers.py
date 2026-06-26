@@ -244,9 +244,10 @@ def _trade_id(
     size: Decimal,
     ts_exchange: str | None,
 ) -> str:
-    provided = _optional_str(message.get("trade_id")) or _optional_str(message.get("id"))
-    if provided is not None:
-        return provided
+    for key in ("trade_id", "id", "transaction_hash"):
+        provided = _optional_str(message.get(key))
+        if provided is not None:
+            return provided
     payload = "|".join(
         [
             condition_id,

@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import ssl
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, TypeVar
 
+import certifi
 import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -143,7 +145,11 @@ class MarketDataIngestor:
         self._recorder.flush_all()
 
     async def _run_once(self, *, deadline: float) -> None:
-        async with connect(self._ws_url, ping_interval=None) as websocket:
+        async with connect(
+            self._ws_url,
+            ping_interval=None,
+            ssl=clob_ssl_context(),
+        ) as websocket:
             await websocket.send(
                 json.dumps(
                     {
@@ -261,6 +267,11 @@ def cast_ws_message(message: str | bytes | bytearray | memoryview) -> str | byte
     if isinstance(message, bytearray):
         return bytes(message)
     return message
+
+
+def clob_ssl_context() -> ssl.SSLContext:
+    """Build a websocket SSL context from certifi's CA bundle."""
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 def _chunks(items: list[T], size: int) -> Iterable[list[T]]:
