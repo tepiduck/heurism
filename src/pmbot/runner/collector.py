@@ -21,10 +21,12 @@ from pmbot.ingestion.gamma import DEFAULT_GAMMA_URL, GammaClient
 from pmbot.ingestion.kalshi import (
     KALSHI_REST_URL,
     KALSHI_WS_URL,
+    KalshiAuth,
     KalshiMetadataClient,
     KalshiRecorderAdapter,
     kalshi_ssl_context,
     kalshi_subscribe_message,
+    kalshi_websocket_headers,
 )
 from pmbot.runner.allowlist import load_verified_pairs
 from pmbot.runner.orchestrator import CollectorOrchestrator
@@ -68,7 +70,12 @@ async def run_collector(
             base_url=_url_or_default(settings.GAMMA_URL, DEFAULT_GAMMA_URL),
             http=http,
         )
-        kalshi_metadata = KalshiMetadataClient(base_url=KALSHI_REST_URL, http=http)
+        kalshi_auth = _kalshi_auth_from_settings(settings)
+        kalshi_metadata = KalshiMetadataClient(
+            base_url=KALSHI_REST_URL,
+            http=http,
+            auth=kalshi_auth,
+        )
         poller = ResolutionPoller(
             pairs=pairs,
             sources=(
@@ -95,6 +102,7 @@ async def run_collector(
                     recorder=recorder,
                     metadata=kalshi_metadata,
                     ws_url=KALSHI_WS_URL,
+                    auth=kalshi_auth,
                 ),
             ),
             resolution_poller=poller,
@@ -156,11 +164,13 @@ class KalshiVenueTask:
         recorder: SignalLoggingRecorder,
         metadata: KalshiMetadataClient,
         ws_url: str,
+        auth: KalshiAuth | None = None,
     ) -> None:
         self._pairs = pairs
         self._adapter = KalshiRecorderAdapter(recorder)
         self._metadata = metadata
         self._ws_url = ws_url
+        self._auth = auth
 
     async def run(self) -> None:
         """Fetch metadata and subscribe to Kalshi orderbook/trade channels."""
@@ -173,6 +183,11 @@ class KalshiVenueTask:
             self._ws_url,
             ping_interval=20.0,
             ssl=kalshi_ssl_context(),
+            additional_headers=(
+                kalshi_websocket_headers(self._auth, ws_url=self._ws_url)
+                if self._auth is not None
+                else None
+            ),
         ) as websocket:
             await websocket.send(
                 json.dumps(
@@ -191,3 +206,14 @@ def _url_or_default(value: object, default: str) -> str:
         return default
     text = str(value)
     return text.rstrip("/") if text.startswith(("http", "ws")) else text
+
+
+def _kalshi_auth_from_settings(settings: Settings) -> KalshiAuth | None:
+    if settings.KALSHI_API_KEY_ID is None and settings.KALSHI_PRIVATE_KEY_PATH is None:
+        return None
+    if settings.KALSHI_API_KEY_ID is None or settings.KALSHI_PRIVATE_KEY_PATH is None:
+        raise ValueError("KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH must be set together")
+    return KalshiAuth.from_private_key_file(
+        key_id=settings.KALSHI_API_KEY_ID.get_secret_value(),
+        private_key_path=settings.KALSHI_PRIVATE_KEY_PATH,
+    )

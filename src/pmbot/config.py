@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     CLOB_WS_URL: AnyUrl | None = None
     GAMMA_URL: AnyHttpUrl | None = None
     WALLET_PRIVATE_KEY: SecretStr | None = Field(default=None, repr=False)
+    KALSHI_API_KEY_ID: SecretStr | None = Field(default=None, repr=False)
+    KALSHI_PRIVATE_KEY_PATH: Path | None = Field(default=None, repr=False)
     MODE: Mode = Mode.PAPER
     DATA_DIR: Path = Path("data")
     LIVE: str | None = Field(default=None, exclude=True, repr=False)

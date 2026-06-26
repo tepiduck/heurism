@@ -9,13 +9,19 @@ from __future__ import annotations
 import json
 import ssl
 import time
+from base64 import b64encode
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 
 import certifi
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from pmbot.ingestion.parsers import parse_decimal
 from pmbot.ingestion.recorder import ParquetRecorder
@@ -31,6 +37,37 @@ from pmbot.ingestion.schemas import (
 
 KALSHI_REST_URL = "https://external-api.kalshi.com/trade-api/v2"
 KALSHI_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+KALSHI_WS_PATH = "/trade-api/ws/v2"
+
+
+@dataclass(frozen=True, slots=True)
+class KalshiAuth:
+    """Signed Kalshi request authentication material."""
+
+    key_id: str
+    private_key: rsa.RSAPrivateKey
+
+    @classmethod
+    def from_private_key_file(cls, *, key_id: str, private_key_path: Path) -> KalshiAuth:
+        return cls(
+            key_id=key_id,
+            private_key=load_kalshi_private_key(private_key_path),
+        )
+
+    def headers_for_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        timestamp_ms: int | None = None,
+    ) -> dict[str, str]:
+        return kalshi_auth_headers(
+            key_id=self.key_id,
+            private_key=self.private_key,
+            method=method,
+            path=path,
+            timestamp_ms=timestamp_ms,
+        )
 
 
 class KalshiMetadataClient:
@@ -41,9 +78,11 @@ class KalshiMetadataClient:
         *,
         base_url: str = KALSHI_REST_URL,
         http: httpx.AsyncClient | None = None,
+        auth: KalshiAuth | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._http = http
+        self._auth = auth
 
     async def fetch_markets(
         self,
@@ -59,8 +98,13 @@ class KalshiMetadataClient:
         if cursor is not None:
             params["cursor"] = cursor
 
+        url = f"{self._base_url}/markets"
         async with self._client() as client:
-            response = await client.get(f"{self._base_url}/markets", params=params)
+            response = await client.get(
+                url,
+                params=params,
+                headers=self._headers_for_url(url),
+            )
             response.raise_for_status()
             payload = json.loads(response.text, parse_float=Decimal)
         if not isinstance(payload, Mapping):
@@ -91,8 +135,9 @@ class KalshiMetadataClient:
 
     async def fetch_market(self, ticker: str) -> MetadataSnapshot:
         """Fetch and normalize one Kalshi market by ticker."""
+        url = f"{self._base_url}/markets/{ticker}"
         async with self._client() as client:
-            response = await client.get(f"{self._base_url}/markets/{ticker}")
+            response = await client.get(url, headers=self._headers_for_url(url))
             response.raise_for_status()
             payload = json.loads(response.text, parse_float=Decimal)
         if not isinstance(payload, Mapping):
@@ -104,6 +149,11 @@ class KalshiMetadataClient:
 
     def _client(self) -> _ClientContext:
         return _ClientContext(self._http)
+
+    def _headers_for_url(self, url: str) -> dict[str, str]:
+        if self._auth is None:
+            return {}
+        return self._auth.headers_for_request(method="GET", path=kalshi_request_path(url))
 
 
 class KalshiRecorderAdapter:
@@ -444,6 +494,63 @@ def kalshi_subscribe_message(
 def kalshi_ssl_context() -> ssl.SSLContext:
     """Build a websocket SSL context from certifi's CA bundle."""
     return ssl.create_default_context(cafile=certifi.where())
+
+
+def kalshi_websocket_headers(
+    auth: KalshiAuth,
+    *,
+    ws_url: str = KALSHI_WS_URL,
+    timestamp_ms: int | None = None,
+) -> dict[str, str]:
+    return auth.headers_for_request(
+        method="GET",
+        path=kalshi_request_path(ws_url),
+        timestamp_ms=timestamp_ms,
+    )
+
+
+def kalshi_auth_headers(
+    *,
+    key_id: str,
+    private_key: rsa.RSAPrivateKey,
+    method: str,
+    path: str,
+    timestamp_ms: int | None = None,
+) -> dict[str, str]:
+    timestamp = str(int(time.time() * 1_000) if timestamp_ms is None else timestamp_ms)
+    message = f"{timestamp}{method.upper()}{path}"
+    signature = sign_kalshi_request(private_key, message)
+    return {
+        "KALSHI-ACCESS-KEY": key_id,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        "KALSHI-ACCESS-SIGNATURE": signature,
+    }
+
+
+def sign_kalshi_request(private_key: rsa.RSAPrivateKey, message: str) -> str:
+    signature = private_key.sign(
+        message.encode("utf-8"),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=32,
+        ),
+        hashes.SHA256(),
+    )
+    return b64encode(signature).decode("ascii")
+
+
+def load_kalshi_private_key(path: Path) -> rsa.RSAPrivateKey:
+    private_key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        raise TypeError("Kalshi private key must be an RSA private key")
+    return private_key
+
+
+def kalshi_request_path(url_or_path: str) -> str:
+    if url_or_path.startswith(("http://", "https://", "ws://", "wss://")):
+        parsed = urlsplit(url_or_path)
+        return parsed.path or "/"
+    return url_or_path.split("?", 1)[0] or "/"
 
 
 class _ClientContext:

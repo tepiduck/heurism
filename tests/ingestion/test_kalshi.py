@@ -1,15 +1,25 @@
 import asyncio
+from base64 import b64decode
 from decimal import Decimal
 
 import httpx
 import polars as pl
 import pytest
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from pmbot.ingestion.kalshi import (
+    KALSHI_WS_PATH,
+    KALSHI_WS_URL,
+    KalshiAuth,
     KalshiMetadataClient,
     KalshiNormalizer,
     KalshiRecorderAdapter,
+    kalshi_auth_headers,
+    kalshi_request_path,
     kalshi_subscribe_message,
+    kalshi_websocket_headers,
+    load_kalshi_private_key,
 )
 from pmbot.ingestion.recorder import ParquetRecorder
 from pmbot.ingestion.schemas import (
@@ -258,6 +268,81 @@ def test_kalshi_recorder_adapter_reuses_shared_parquet_recorder(tmp_path) -> Non
     assert len(files) == 1
     assert frame["price"].to_list() == [Decimal("0.4200000000"), Decimal("0.4400000000")]
     assert frame["size"].to_list() == [Decimal("10.0000000000"), Decimal("15.0000000000")]
+
+
+def test_kalshi_auth_headers_sign_known_websocket_message(tmp_path) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key_path = tmp_path / "kalshi-test.pem"
+    key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    loaded_key = load_kalshi_private_key(key_path)
+
+    headers = kalshi_auth_headers(
+        key_id="test-key-id",
+        private_key=loaded_key,
+        method="GET",
+        path=KALSHI_WS_PATH,
+        timestamp_ms=1_782_460_000_000,
+    )
+
+    assert headers["KALSHI-ACCESS-KEY"] == "test-key-id"
+    assert headers["KALSHI-ACCESS-TIMESTAMP"] == "1782460000000"
+    loaded_key.public_key().verify(
+        b64decode(headers["KALSHI-ACCESS-SIGNATURE"]),
+        b"1782460000000GET/trade-api/ws/v2",
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=32,
+        ),
+        hashes.SHA256(),
+    )
+
+
+def test_kalshi_websocket_headers_sign_documented_path() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    auth = KalshiAuth(key_id="test-key-id", private_key=private_key)
+
+    headers = kalshi_websocket_headers(
+        auth,
+        ws_url=KALSHI_WS_URL,
+        timestamp_ms=1_782_460_000_001,
+    )
+
+    assert kalshi_request_path(KALSHI_WS_URL) == KALSHI_WS_PATH
+    private_key.public_key().verify(
+        b64decode(headers["KALSHI-ACCESS-SIGNATURE"]),
+        b"1782460000001GET/trade-api/ws/v2",
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=32,
+        ),
+        hashes.SHA256(),
+    )
+
+
+def test_kalshi_metadata_client_adds_auth_headers() -> None:
+    async def run() -> None:
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        auth = KalshiAuth(key_id="test-key-id", private_key=private_key)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["KALSHI-ACCESS-KEY"] == "test-key-id"
+            assert request.headers["KALSHI-ACCESS-TIMESTAMP"]
+            assert request.headers["KALSHI-ACCESS-SIGNATURE"]
+            return httpx.Response(200, json={"markets": [], "cursor": ""})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            page, cursor = await KalshiMetadataClient(http=http, auth=auth).fetch_markets()
+
+        assert page == []
+        assert cursor is None
+
+    asyncio.run(run())
 
 
 @pytest.mark.xfail(
