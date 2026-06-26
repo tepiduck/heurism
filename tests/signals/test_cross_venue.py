@@ -9,13 +9,20 @@ from pmbot.signals.contracts import VerifiedContractPair
 from pmbot.signals.cross_venue import (
     CrossVenueSignal,
     CrossVenueSignalConfig,
+    LeadLagSample,
+    RegressionFeatures,
+    ShrinkageRegressionObservation,
     SignalDirection,
+    fit_shrinkage_regression,
+    fit_shrinkage_train_test,
     guarded_log_odds_pool,
+    lead_lag_diagnostics,
 )
 
 BASE_TS = 1_800_000_000_000_000_000
 PM_CONDITION_ID = "pm-condition-1"
 PM_ASSET_ID = "pm-yes-token"
+PM_NO_ASSET_ID = "pm-no-token"
 KALSHI_TICKER = "KXTEST-YES"
 PAIR = VerifiedContractPair(
     polymarket_condition_id=PM_CONDITION_ID,
@@ -29,6 +36,7 @@ PAIR_INVERTED = VerifiedContractPair(
     kalshi_ticker=KALSHI_TICKER,
     rationale="fixture pair with Kalshi YES inverted",
     invert_kalshi=True,
+    polymarket_no_asset_id=PM_NO_ASSET_ID,
 )
 
 
@@ -66,6 +74,7 @@ def test_cross_venue_signal_produces_expected_deviation() -> None:
     BacktestEngine(zero_cost_backtest_config()).run(
         [
             *pm_snapshot(BASE_TS, bid="0.49", ask="0.51", size="10"),
+            *pm_no_snapshot(BASE_TS, bid="0.47", ask="0.53", size="10"),
             *kalshi_snapshot(BASE_TS + 1, bid="0.69", ask="0.71", size="10"),
         ],
         strategy,
@@ -107,6 +116,7 @@ def test_cross_venue_signal_inverts_kalshi_probability_before_pooling() -> None:
     BacktestEngine(zero_cost_backtest_config()).run(
         [
             *pm_snapshot(BASE_TS, bid="0.49", ask="0.51", size="10"),
+            *pm_no_snapshot(BASE_TS, bid="0.47", ask="0.53", size="10"),
             *kalshi_snapshot(BASE_TS + 1, bid="0.69", ask="0.71", size="10"),
         ],
         strategy,
@@ -116,6 +126,39 @@ def test_cross_venue_signal_inverts_kalshi_probability_before_pooling() -> None:
     assert inverted[-1] == Decimal("-0.104356076261")
     assert direct[-1] == -inverted[-1]
     assert inverted_directions[-1] == SignalDirection.SELL
+
+
+def test_no_side_trade_gate_uses_no_ask_and_one_minus_p_hat() -> None:
+    signal = CrossVenueSignal(
+        (PAIR_INVERTED,),
+        CrossVenueSignalConfig(
+            kalshi_weight=Decimal("1"),
+            double_counting_overlap=Decimal("0.50"),
+            trade_threshold=Decimal("0.01"),
+        ),
+    )
+    observed: list[tuple[SignalDirection, Decimal | None, Decimal | None]] = []
+
+    def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        values = signal.compute(view)
+        if values:
+            observed.append((values[0].direction, values[0].polymarket_no_ask, values[0].no_edge))
+        return ()
+
+    BacktestEngine(zero_cost_backtest_config()).run(
+        [
+            *pm_snapshot(BASE_TS, bid="0.49", ask="0.51", size="10"),
+            *pm_no_snapshot(BASE_TS, bid="0.44", ask="0.55", size="10"),
+            *kalshi_snapshot(BASE_TS + 1, bid="0.69", ask="0.71", size="10"),
+        ],
+        strategy,
+    )
+
+    direction, no_ask, no_edge = observed[-1]
+    assert direction == SignalDirection.SELL
+    assert no_ask == Decimal("0.55")
+    assert no_edge is not None
+    assert no_edge.quantize(Decimal("0.000000000001")) == Decimal("0.054356076261")
 
 
 def test_cross_venue_signal_ignores_future_reference_data() -> None:
@@ -146,6 +189,159 @@ def test_cross_venue_signal_ignores_future_reference_data() -> None:
     )
 
     assert at_base == [Decimal("0.50")]
+
+
+def test_signal_requires_fresh_exchange_time_not_local_capture_time() -> None:
+    signal = CrossVenueSignal(
+        (PAIR,),
+        CrossVenueSignalConfig(
+            kalshi_weight=Decimal("1"),
+            double_counting_overlap=Decimal("0"),
+            trade_threshold=Decimal("0.01"),
+            max_quote_age_ns=10,
+        ),
+    )
+    observed: list[Decimal] = []
+
+    def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        values = signal.compute(view)
+        if values:
+            observed.append(values[0].fair_probability)
+        return ()
+
+    BacktestEngine(zero_cost_backtest_config()).run(
+        [
+            *pm_snapshot(BASE_TS, bid="0.49", ask="0.51", size="10", exchange_ts=100),
+            *kalshi_snapshot(
+                BASE_TS + 1_000_000,
+                bid="0.69",
+                ask="0.71",
+                size="10",
+                exchange_ts=1_000_000_000_000,
+            ),
+        ],
+        strategy,
+    )
+
+    assert observed == []
+
+
+def test_fitted_shrinkage_regression_recovers_known_beta() -> None:
+    observations = tuple(
+        regression_row(pm, kalshi, beta=Decimal("0.40"))
+        for pm, kalshi in (
+            ("0.35", "0.40"),
+            ("0.42", "0.50"),
+            ("0.50", "0.55"),
+            ("0.58", "0.65"),
+            ("0.64", "0.70"),
+            ("0.72", "0.76"),
+        )
+    )
+
+    model = fit_shrinkage_regression(observations)
+    report = model.restriction_report(test=observations)
+
+    assert model.alpha.copy_abs() < Decimal("0.000000001")
+    assert model.gamma.quantize(Decimal("0.000001")) == Decimal("1.000000")
+    assert model.beta.quantize(Decimal("0.000001")) == Decimal("0.400000")
+    assert report.holds is True
+    assert report.out_of_sample_brier_skill is not None
+    assert report.out_of_sample_brier_skill > 0
+
+
+def test_shrinkage_train_test_helper_fits_on_train_and_reports_test() -> None:
+    train = tuple(
+        regression_row(pm, kalshi, beta=Decimal("0.40"))
+        for pm, kalshi in (
+            ("0.35", "0.40"),
+            ("0.42", "0.50"),
+            ("0.50", "0.55"),
+            ("0.58", "0.65"),
+            ("0.64", "0.70"),
+            ("0.72", "0.76"),
+        )
+    )
+    test = tuple(
+        regression_row(pm, kalshi, beta=Decimal("0.40"))
+        for pm, kalshi in (("0.38", "0.44"), ("0.62", "0.68"), ("0.75", "0.80"))
+    )
+
+    result = fit_shrinkage_train_test(train=train, test=test)
+
+    assert result.model.beta.quantize(Decimal("0.000001")) == Decimal("0.400000")
+    assert result.train_report.n_test == len(train)
+    assert result.test_report.n_test == len(test)
+    assert result.test_report.out_of_sample_brier_skill is not None
+
+
+def test_signal_uses_fitted_regression_when_available() -> None:
+    model = fit_shrinkage_regression(
+        tuple(
+            regression_row(pm, kalshi, beta=Decimal("0.25"))
+            for pm, kalshi in (
+                ("0.35", "0.40"),
+                ("0.42", "0.50"),
+                ("0.50", "0.55"),
+                ("0.58", "0.65"),
+                ("0.64", "0.70"),
+                ("0.72", "0.76"),
+            )
+        )
+    )
+    signal = CrossVenueSignal(
+        (PAIR,),
+        CrossVenueSignalConfig(
+            shrinkage_model=model,
+            trade_threshold=Decimal("0.01"),
+        ),
+    )
+    observed: list[tuple[str, Decimal, Decimal]] = []
+
+    def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        values = signal.compute(view)
+        if values:
+            observed.append(
+                (
+                    values[0].model_status,
+                    values[0].resolution_probability,
+                    values[0].convergence_logit_delta,
+                )
+            )
+        return ()
+
+    BacktestEngine(zero_cost_backtest_config()).run(
+        [
+            *pm_snapshot(BASE_TS, bid="0.49", ask="0.51", size="10"),
+            *kalshi_snapshot(BASE_TS + 1, bid="0.69", ask="0.71", size="10"),
+        ],
+        strategy,
+    )
+
+    model_status, resolution_probability, convergence_delta = observed[-1]
+    assert model_status == "fitted_shrinkage_regression"
+    assert resolution_probability.quantize(Decimal("0.000000000001")) == Decimal(
+        "0.552758990724"
+    )
+    assert convergence_delta > Decimal("0")
+
+
+def test_lead_lag_placebos_do_not_invert_a_kalshi_leads_fixture() -> None:
+    diagnostics = lead_lag_diagnostics(
+        (
+            lead_lag_row(1, "0.45", "0.55", "0.50", "0.55"),
+            lead_lag_row(2, "0.55", "0.45", "0.50", "0.45"),
+            lead_lag_row(3, "0.45", "0.55", "0.50", "0.55"),
+            lead_lag_row(4, "0.55", "0.45", "0.50", "0.45"),
+        ),
+        polling_stride=3,
+    )
+
+    assert diagnostics.forward_score > 0
+    assert diagnostics.reverse_placebo_score <= 0
+    assert diagnostics.shifted_time_placebo_score <= diagnostics.forward_score * 0.25
+    assert diagnostics.polling_frequency_score > 0
+    assert diagnostics.passes_placebos is True
 
 
 def test_signal_runs_through_backtester_fixture_and_emits_polymarket_order() -> None:
@@ -210,17 +406,93 @@ def zero_cost_backtest_config() -> BacktestConfig:
     return BacktestConfig(latency_ms=0, costs=CostConfig.zero(), allow_zero_costs=True)
 
 
-def pm_snapshot(ts: int, *, bid: str, ask: str, size: str) -> tuple[BookEvent, BookEvent]:
+def pm_snapshot(
+    ts: int,
+    *,
+    bid: str,
+    ask: str,
+    size: str,
+    exchange_ts: int | None = None,
+) -> tuple[BookEvent, BookEvent]:
     return (
-        book_event(ts, PM_CONDITION_ID, PM_ASSET_ID, BookSide.BID, bid, size),
-        book_event(ts, PM_CONDITION_ID, PM_ASSET_ID, BookSide.ASK, ask, size),
+        book_event(
+            ts,
+            PM_CONDITION_ID,
+            PM_ASSET_ID,
+            BookSide.BID,
+            bid,
+            size,
+            exchange_ts=exchange_ts,
+        ),
+        book_event(
+            ts,
+            PM_CONDITION_ID,
+            PM_ASSET_ID,
+            BookSide.ASK,
+            ask,
+            size,
+            exchange_ts=exchange_ts,
+        ),
     )
 
 
-def kalshi_snapshot(ts: int, *, bid: str, ask: str, size: str) -> tuple[BookEvent, BookEvent]:
+def pm_no_snapshot(
+    ts: int,
+    *,
+    bid: str,
+    ask: str,
+    size: str,
+    exchange_ts: int | None = None,
+) -> tuple[BookEvent, BookEvent]:
     return (
-        book_event(ts, KALSHI_TICKER, KALSHI_TICKER, BookSide.BID, bid, size),
-        book_event(ts, KALSHI_TICKER, KALSHI_TICKER, BookSide.ASK, ask, size),
+        book_event(
+            ts,
+            PM_CONDITION_ID,
+            PM_NO_ASSET_ID,
+            BookSide.BID,
+            bid,
+            size,
+            exchange_ts=exchange_ts,
+        ),
+        book_event(
+            ts,
+            PM_CONDITION_ID,
+            PM_NO_ASSET_ID,
+            BookSide.ASK,
+            ask,
+            size,
+            exchange_ts=exchange_ts,
+        ),
+    )
+
+
+def kalshi_snapshot(
+    ts: int,
+    *,
+    bid: str,
+    ask: str,
+    size: str,
+    exchange_ts: int | None = None,
+) -> tuple[BookEvent, BookEvent]:
+    return (
+        book_event(
+            ts,
+            KALSHI_TICKER,
+            KALSHI_TICKER,
+            BookSide.BID,
+            bid,
+            size,
+            exchange_ts=exchange_ts,
+        ),
+        book_event(
+            ts,
+            KALSHI_TICKER,
+            KALSHI_TICKER,
+            BookSide.ASK,
+            ask,
+            size,
+            exchange_ts=exchange_ts,
+        ),
     )
 
 
@@ -231,11 +503,12 @@ def book_event(
     side: BookSide,
     price: str,
     size: str,
+    exchange_ts: int | None = None,
 ) -> BookEvent:
     return BookEvent(
         ts_local_ns=ts,
         ts_monotonic_ns=None,
-        ts_exchange=None,
+        ts_exchange=str(ts if exchange_ts is None else exchange_ts),
         condition_id=condition_id,
         asset_id=asset_id,
         event_type=BookEventType.SNAPSHOT,
@@ -244,3 +517,46 @@ def book_event(
         size=Decimal(size),
         seq_or_hash=f"{asset_id}-{ts}",
     )
+
+
+def regression_row(
+    polymarket: str,
+    kalshi: str,
+    *,
+    beta: Decimal,
+) -> ShrinkageRegressionObservation:
+    pm_probability = Decimal(polymarket)
+    kalshi_probability = Decimal(kalshi)
+    target_logit = logit(pm_probability) + beta * (
+        logit(kalshi_probability) - logit(pm_probability)
+    )
+    return ShrinkageRegressionObservation(
+        polymarket_probability=pm_probability,
+        kalshi_probability=kalshi_probability,
+        target_probability=inv_logit(target_logit),
+        features=RegressionFeatures(),
+    )
+
+
+def lead_lag_row(
+    ts: int,
+    polymarket: str,
+    kalshi: str,
+    next_polymarket: str,
+    next_kalshi: str,
+) -> LeadLagSample:
+    return LeadLagSample(
+        ts_exchange_ns=ts,
+        polymarket_probability=Decimal(polymarket),
+        kalshi_probability=Decimal(kalshi),
+        next_polymarket_probability=Decimal(next_polymarket),
+        next_kalshi_probability=Decimal(next_kalshi),
+    )
+
+
+def logit(probability: Decimal) -> Decimal:
+    return (probability / (Decimal("1") - probability)).ln()
+
+
+def inv_logit(log_odds: Decimal) -> Decimal:
+    return Decimal("1") / (Decimal("1") + (-log_odds).exp())

@@ -75,6 +75,33 @@ Microstructure is **cost reduction, not alpha**, on a venue this slow. Post pass
 
 ---
 
+## v3 — corrections from external review (accepted)
+
+An external review correctly flagged that v2 presented several empirical heuristics as mathematical equivalences. Accepted corrections, to be reflected in WP-3/4/5:
+
+1. **The overlap pool is empirical shrinkage, not a derived double-counting correction.** Independence does NOT imply `w=1` (min-variance weight `w* = (Var_PM − Cov)/(Var_PM+Var_K−2Cov)`; equal-precision independent → `w=0.5`). Replace the hardcoded `overlap` with the estimated regression `ẑ = α + γ·z_PM + β·(z_K − z_PM) + Xθ`, test `α=0, γ=1, 0≤β≤1` out of sample, conditioned on horizon/category/liquidity/quote-age. Log pooling is not auto-calibrated either — recalibrate empirically.
+
+2. **Separate two distinct models/targets:**
+   - *Resolution model* `P(Y=1 | info)` — for held-to-resolution; scored by Brier/log-loss.
+   - *Convergence model* `E[Δz_PM over horizon h | z_K−z_PM, X]` — for exit-before-resolution; scored by realized markout PnL, NOT Brier.
+   Our thesis is convergence; do not validate it with outcome-forecasting scores alone. (For short-horizon markets like World Cup the two nearly coincide; for longer horizons they diverge.)
+
+3. **Distinguish forecast price from executable price.** Use a latent mid/microprice `m_PM` for the *forecast baseline*; use executable `A_Y/A_N` (asks) and `B_Y/B_N` (bids) for *entry/exit/PnL*. Scoring a forecast against an ASK manufactures fake skill (you're scoring the spread). The NO trade uses the NO book's own ask: `buy NO if (1−p̂) − A_N > 0` — NOT the YES formula applied to `|s|`.
+
+4. **Cost gate:** define the uncertainty term properly — `σ̂` is forecast/parameter uncertainty (bootstrap over β, calibration error, quote staleness), NOT `√(p̂(1−p̂))`. Prefer a lower bootstrap/posterior quantile of net EV `> 0`. Adverse selection is direction/age/imbalance-dependent, not a constant. Round-trip = entry fee at entry price + exit fee at exit price; query per-market fee config, don't hardcode θ.
+
+5. **Sizing:** side-specific Kelly — `f_Y* = (p̂−q_Y)/(1−q_Y)`, `f_N* = ((1−p̂)−q_N)/(1−q_N)`, using executable all-in cost `q`. `Σ⁻¹μ` is only the small-bet approximation; use scenario-based `max E[log(1+fᵀR)]` for mutually-exclusive/nested markets (team A / tie / team B — covariance misses that exactly one resolves). Fractional Kelly is a policy justified by cross-trade estimation error / misspecification / drawdown limits — NOT by single-bet posterior variance (`g(f;p)` is linear in `p` for fixed `f`, so `E_p[g]=g(E[p])`). Stress-test λ jointly with the uncertainty gate so conservatism isn't double-counted.
+
+6. **Verdict criterion (replaces "positive Brier skill ⇔ alpha", which is false):** require BOTH (a) paired proper-score improvement on an untouched walk-forward holdout, AND (b) positive net expected PnL on the predeclared trading rule using actual fills — both with **event-clustered** uncertainty.
+
+7. **Effective sample size:** a match/event is ~one independent observation, not N ticks. Cluster scoring + bootstrap by distinct underlying outcome (and event family/date). Report distinct events, not trades. Sharpe from an equity-return time series with overlap-adjustment, not per-fill returns.
+
+8. **Lead-lag audit (before claiming any lead-lag edge):** use exchange timestamps + quote ages, not local capture time; trade only fresh two-sided books; event-time not forward-filled wall-clock; run reverse-direction and shifted-time placebo tests and polling-frequency sensitivity. Thin-market staleness can manufacture an apparent (non-executable) Kalshi lead.
+
+9. **Basis risk (already enforced via the strict mapper):** if contracts differ, `p_K` estimates `P(Y_K=1)` but payout depends on `Y_PM` — reject the pair or model `P(Y_PM=1 | p_K, rule diff)`. Never pool prices across non-identical resolution criteria.
+
+10. **Reproducibility:** reconcile every reported metric and deployed config from a single immutable run manifest.
+
 ## Sources
 
 Kelly / sizing: Whelan 2023 (karlwhelan.com/Papers/KellyJuly2023.pdf); Thorp (gwern.net/doc/statistics/decision/2006-thorp.pdf); MacLean–Thorp–Ziemba (stat.berkeley.edu/~aldous/157/Papers/Good_Bad_Kelly.pdf); Busseti–Ryu–Boyd, risk-constrained Kelly (arxiv.org/pdf/1603.06183); Meister, Kelly for prediction markets (arxiv.org/html/2412.14144v1).

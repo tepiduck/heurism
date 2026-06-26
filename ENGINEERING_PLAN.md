@@ -53,6 +53,12 @@ ingestion (CLOB websocket + Gamma REST)
 - **WP-7 — Live loop + monitoring:** orchestrate ingest→signal→size→execute; logging, alerting, heartbeat, panic-flatten.
 - **WP-8 — Cross-market arbitrage (penciled, AFTER single-leg validates):** true dual-leg arb over verified contract pairs (buy YES cheap venue + NO dear venue for combined cost <$1). Builds on the WP-3 mapper + a dual-venue executor extending WP-6. Deferred: most-competed, fee-hostile near p=0.5, and intensifies the US-geofencing legal exposure (requires trading both Kalshi + Polymarket as a US person). Do not build until the cross-venue single-leg signal is shown to pay in WP-4.
 
+### Backlog — methodology upgrades from external review (see STRATEGY.md "v3")
+These refine WP-3/4/5 before any real-money sizing (none block data collection):
+- **WP-3:** replace hardcoded `overlap` with the estimated regression `ẑ=α+γz_PM+β(z_K−z_PM)+Xθ`; separate resolution-model vs convergence-model targets; use exchange timestamps + placebo tests for lead-lag; separate forecast mid from executable bid/ask.
+- **WP-4:** dual go/no-go (paired proper-score on holdout AND net-PnL on predeclared rule); **event-clustered** bootstrap (a match = ~1 obs, not N ticks); baseline must be a mid, not an ask (scoring vs an ask fakes skill); markout-PnL eval for convergence trades; single immutable run manifest.
+- **WP-5:** side-specific Kelly with executable all-in cost; scenario-based `max E[log(1+fᵀR)]` for mutually-exclusive markets (not `Σ⁻¹μ`); define `σ̂` as forecast uncertainty (not `√(p̂(1−p̂))`) or use a net-EV quantile gate; round-trip two-sided fees.
+
 ### WP-3 status: ✅ implemented, with one required fix
 Cross-venue signal + feature lib + conservative mapper done. **Required fix before trusting it: the mapper has NO YES/NO polarity check** — mapping PM-YES to an oppositely-defined Kalshi-YES flips the signal sign and trades backwards with full confidence. See fix below. Also flagged for WP-4 to calibrate: `double_counting_overlap=0.5` (hardcoded; collapses the guard to an equal-weight log-odds average), the `confidence = |signal|×4×freshness` scalar, and the "Kalshi leads" guard which is currently a freshness filter, not true lead-lag.
 

@@ -33,6 +33,7 @@ class ManualAllowlistEntry:
     kalshi_yes_payout_condition: str
     invert: bool
     rationale: str
+    polymarket_no_asset_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +45,7 @@ class VerifiedContractPair:
     kalshi_ticker: str
     rationale: str
     invert_kalshi: bool = False
+    polymarket_no_asset_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +91,7 @@ class ContractMapper:
                     f"kalshi_inverted={manual.invert}"
                 ),
                 invert_kalshi=manual.invert,
+                polymarket_no_asset_id=manual.polymarket_no_asset_id,
             )
 
         if _norm(polymarket.title) != _norm(kalshi.title):
@@ -151,6 +154,7 @@ def load_manual_allowlist(rows: Iterable[Mapping[str, object]]) -> tuple[ManualA
             kalshi_yes_payout_condition=_required_row_str(row, "kalshi_yes_payout_condition"),
             invert=_required_row_bool(row, "invert"),
             rationale=_required_row_str(row, "rationale"),
+            polymarket_no_asset_id=_optional_row_str(row, "polymarket_no_asset_id"),
         )
         for row in rows
     )
@@ -185,6 +189,15 @@ def _required_row_bool(row: Mapping[str, object], key: str) -> bool:
         if normalized in {"0", "false", "no"}:
             return False
     raise TypeError(f"{key} must be a bool")
+
+
+def _optional_row_str(row: Mapping[str, object], key: str) -> str | None:
+    value = row.get(key)
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value
+    raise TypeError(f"{key} must be a string when supplied")
 
 
 def _norm(value: str) -> str:

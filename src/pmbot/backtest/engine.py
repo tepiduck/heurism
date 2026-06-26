@@ -231,7 +231,10 @@ class _ReplayState:
                 position=position,
                 mode=self.marking_mode,
             )
-            mtm += position * (mark_price or Decimal("0"))
+            if mark_price is None:
+                mark_valid = False
+                continue
+            mtm += position * mark_price
         self.pnl_series.append(
             PositionMark.create(
                 ts_local_ns=ts_local_ns,
@@ -249,12 +252,18 @@ class _ReplayState:
         if self.book.is_marketable(order.request):
             remaining = self._fill_marketable(order)
             if remaining > Decimal("0") and order.request.order_type == OrderType.LIMIT:
-                self._rest(order, remaining)
+                self._rest(order, remaining, synthetic_queue_ahead=remaining)
             return
         if order.request.order_type == OrderType.LIMIT:
             self._rest(order, order.request.size)
 
-    def _rest(self, order: PendingOrder, remaining: Decimal) -> None:
+    def _rest(
+        self,
+        order: PendingOrder,
+        remaining: Decimal,
+        *,
+        synthetic_queue_ahead: Decimal = Decimal("0"),
+    ) -> None:
         if order.request.limit_price is None:
             return
         self.resting.append(
@@ -264,7 +273,10 @@ class _ReplayState:
                 decision_ts_local_ns=order.decision_ts_local_ns,
                 arrival_ts_local_ns=order.arrival_ts_local_ns,
                 remaining_size=remaining,
-                queue_ahead=self.book.queue_ahead(order.request),
+                queue_ahead=self.book.queue_ahead(
+                    order.request,
+                    synthetic_ahead=synthetic_queue_ahead,
+                ),
             )
         )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 
 from pmbot.backtest.book import OrderBookState
@@ -23,17 +24,31 @@ class SignalEventObserver:
         pairs: tuple[VerifiedContractPair, ...],
         signal_writer: SignalParquetWriter,
         state: CollectorStateStore | None = None,
+        max_history_events: int = 10_000,
+        max_history_trades: int = 2_000,
     ) -> None:
         self._pairs = pairs
         self._signal = CrossVenueSignal(pairs)
         self._signal_writer = signal_writer
         self._state = state
         self._book = OrderBookState()
-        self._events: list[BookEvent | TradeEvent | GapEvent] = []
-        self._trades: list[TradeEvent] = []
+        self._events: deque[BookEvent | TradeEvent | GapEvent] = deque(
+            maxlen=max_history_events
+        )
+        self._trades: deque[TradeEvent] = deque(maxlen=max_history_trades)
         self._gap_assets: set[str] = set()
         self._gap_conditions: set[str] = set()
         self._venue_by_asset = _venue_map(pairs)
+
+    @property
+    def recent_event_count(self) -> int:
+        """Return bounded event history size for diagnostics/tests."""
+        return len(self._events)
+
+    @property
+    def recent_trade_count(self) -> int:
+        """Return bounded trade history size for diagnostics/tests."""
+        return len(self._trades)
 
     def observe(self, event: NormalizedEvent) -> None:
         """Observe one normalized event and log any computable signals."""
@@ -121,6 +136,8 @@ def _venue_map(pairs: tuple[VerifiedContractPair, ...]) -> dict[str, str]:
     venue_by_asset: dict[str, str] = {}
     for pair in pairs:
         venue_by_asset[pair.polymarket_asset_id] = "polymarket"
+        if pair.polymarket_no_asset_id is not None:
+            venue_by_asset[pair.polymarket_no_asset_id] = "polymarket"
         venue_by_asset[pair.polymarket_condition_id] = "polymarket"
         venue_by_asset[pair.kalshi_ticker] = "kalshi"
     return venue_by_asset

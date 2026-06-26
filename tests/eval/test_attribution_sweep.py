@@ -76,6 +76,31 @@ def test_sweep_selects_parameters_on_train_only_then_validates_on_test() -> None
     assert result.test_performance.brier_skill < result.train_performance.brier_skill
 
 
+def test_sweep_selection_ignores_test_best_candidate() -> None:
+    train_best = ParameterCandidate(
+        double_counting_overlap=Decimal("0"),
+        confidence_scalar=Decimal("1"),
+    )
+    test_best = ParameterCandidate(
+        double_counting_overlap=Decimal("1"),
+        confidence_scalar=Decimal("1"),
+    )
+    train = (
+        cross_venue_row("train-1", polymarket="0.50", kalshi="0.90", realized=1),
+        cross_venue_row("train-2", polymarket="0.50", kalshi="0.90", realized=1),
+    )
+    test = (
+        cross_venue_row("test-1", polymarket="0.50", kalshi="0.90", realized=0),
+        cross_venue_row("test-2", polymarket="0.50", kalshi="0.90", realized=0),
+    )
+
+    result = sweep_train_test(train=train, test=test, candidates=(train_best, test_best))
+
+    assert result.selected == train_best
+    assert result.test_performance.candidate == train_best
+    assert result.test_performance.brier_skill < 0
+
+
 def mark(ts: int, pnl: str, valid: bool) -> PositionMark:
     return PositionMark.create(
         ts_local_ns=ts,

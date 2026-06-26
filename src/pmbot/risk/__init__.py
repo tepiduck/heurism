@@ -1,1 +1,43 @@
-"""Risk management scaffolding."""
+"""Risk management and sizing."""
+
+from pmbot.risk.sizing import (
+    BinarySide,
+    ExecutableQuote,
+    PolicyStressResult,
+    ScenarioOptimizationResult,
+    Sizer,
+    SizingConfig,
+    SizingDecision,
+    SizingMode,
+    ValidationToken,
+    executable_all_in_cost,
+    independent_binary_kelly_fractions,
+    lower_net_ev_quantile,
+    no_kelly_fraction,
+    optimize_mutually_exclusive_scenario,
+    round_trip_cost_per_contract,
+    side_specific_kelly_fraction,
+    stress_test_side_policy,
+    yes_kelly_fraction,
+)
+
+__all__ = [
+    "BinarySide",
+    "ExecutableQuote",
+    "PolicyStressResult",
+    "ScenarioOptimizationResult",
+    "Sizer",
+    "SizingConfig",
+    "SizingDecision",
+    "SizingMode",
+    "ValidationToken",
+    "executable_all_in_cost",
+    "independent_binary_kelly_fractions",
+    "lower_net_ev_quantile",
+    "no_kelly_fraction",
+    "optimize_mutually_exclusive_scenario",
+    "round_trip_cost_per_contract",
+    "side_specific_kelly_fraction",
+    "stress_test_side_policy",
+    "yes_kelly_fraction",
+]

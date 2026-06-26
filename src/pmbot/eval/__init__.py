@@ -2,6 +2,7 @@
 
 from pmbot.eval.calibration import reliability_curve
 from pmbot.eval.clv import cross_venue_clv
+from pmbot.eval.manifest import manifest_payload, write_run_manifest
 from pmbot.eval.models import (
     BootstrapInterval,
     CalibrationBin,
@@ -19,6 +20,7 @@ from pmbot.eval.models import (
     ScoreSummary,
     ShortfallSummary,
     SweepResult,
+    VerdictSummary,
 )
 from pmbot.eval.pnl import pnl_metrics
 from pmbot.eval.report import build_evaluation_report
@@ -43,6 +45,7 @@ __all__ = [
     "ScoreSummary",
     "ShortfallSummary",
     "SweepResult",
+    "VerdictSummary",
     "brier_score",
     "brier_skill",
     "build_evaluation_report",
@@ -50,9 +53,11 @@ __all__ = [
     "evaluate_candidate",
     "implementation_shortfall",
     "log_loss",
+    "manifest_payload",
     "pnl_metrics",
     "reliability_curve",
     "score_forecasts",
     "select_parameter",
     "sweep_train_test",
+    "write_run_manifest",
 ]

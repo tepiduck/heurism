@@ -21,6 +21,8 @@ from pmbot.ingestion.schemas import (
     BookEvent,
     BookEventType,
     BookSide,
+    GapEvent,
+    GapReason,
     MetadataSnapshot,
     TradeEvent,
 )
@@ -158,13 +160,14 @@ class KalshiNormalizer:
     def __init__(self) -> None:
         self._yes_bids: dict[str, dict[Decimal, Decimal]] = {}
         self._no_bids: dict[str, dict[Decimal, Decimal]] = {}
+        self._last_sequence: dict[str, int] = {}
 
     def parse_frame(
         self,
         frame: str | bytes,
         ts_local_ns: int | None = None,
         ts_monotonic_ns: int | None = None,
-    ) -> tuple[BookEvent | TradeEvent, ...]:
+    ) -> tuple[BookEvent | TradeEvent | GapEvent, ...]:
         """Parse a raw Kalshi websocket frame."""
         payload = json.loads(frame.decode("utf-8") if isinstance(frame, bytes) else frame)
         return self.parse_payload(
@@ -178,7 +181,7 @@ class KalshiNormalizer:
         payload: Mapping[str, object],
         ts_local_ns: int | None = None,
         ts_monotonic_ns: int | None = None,
-    ) -> tuple[BookEvent | TradeEvent, ...]:
+    ) -> tuple[BookEvent | TradeEvent | GapEvent, ...]:
         """Parse an already-decoded Kalshi payload."""
         capture_local_ns = time.time_ns() if ts_local_ns is None else ts_local_ns
         capture_monotonic_ns = (
@@ -191,12 +194,21 @@ class KalshiNormalizer:
         if not isinstance(raw_message, Mapping):
             return ()
         message = cast(Mapping[str, object], raw_message)
+        ticker = _optional_str(message.get("market_ticker"))
+        gaps = self._sequence_gaps(payload, ticker, capture_local_ns, capture_monotonic_ns)
         if message_type == "orderbook_snapshot":
-            return self._parse_snapshot(message, capture_local_ns, capture_monotonic_ns)
+            return (
+                *gaps,
+                self._reconnect_gap(message, capture_local_ns, capture_monotonic_ns),
+                *self._parse_snapshot(message, capture_local_ns, capture_monotonic_ns),
+            )
         if message_type == "orderbook_delta":
-            return self._parse_delta(payload, message, capture_local_ns, capture_monotonic_ns)
+            return (
+                *gaps,
+                *self._parse_delta(payload, message, capture_local_ns, capture_monotonic_ns),
+            )
         if message_type == "trade":
-            return (self._parse_trade(message, capture_local_ns, capture_monotonic_ns),)
+            return (*gaps, self._parse_trade(message, capture_local_ns, capture_monotonic_ns))
         return ()
 
     def _parse_snapshot(
@@ -207,8 +219,12 @@ class KalshiNormalizer:
     ) -> tuple[BookEvent, ...]:
         ticker = _required_str(message, "market_ticker")
         seq_or_hash = _optional_str(message.get("market_id"))
-        yes_levels = _levels(message.get("yes_dollars_fp", message.get("yes_dollars")))
-        no_levels = _levels(message.get("no_dollars_fp", message.get("no_dollars")))
+        yes_levels = _levels(
+            message.get("yes_dollars_fp", message.get("yes_dollars", message.get("yes")))
+        )
+        no_levels = _levels(
+            message.get("no_dollars_fp", message.get("no_dollars", message.get("no")))
+        )
         self._yes_bids[ticker] = dict(yes_levels)
         self._no_bids[ticker] = dict(no_levels)
 
@@ -249,19 +265,37 @@ class KalshiNormalizer:
         message: Mapping[str, object],
         ts_local_ns: int,
         ts_monotonic_ns: int | None,
-    ) -> tuple[BookEvent, ...]:
+    ) -> tuple[BookEvent | GapEvent, ...]:
         ticker = _required_str(message, "market_ticker")
         side = _required_str(message, "side")
-        price = parse_decimal(message["price_dollars"])
-        delta = parse_decimal(message["delta_fp"])
+        price = _parse_probability_price(_first_present(message, "price_dollars", "price"))
+        delta = parse_decimal(_first_present(message, "delta_fp", "delta"))
         seq = _optional_str(payload.get("seq"))
         ts_exchange = _optional_str(message.get("ts_ms")) or _optional_str(message.get("ts"))
+        missing_snapshot = ticker not in self._yes_bids and ticker not in self._no_bids
+        gaps = (
+            (
+                GapEvent(
+                    ts_local_ns=ts_local_ns,
+                    ts_monotonic_ns=ts_monotonic_ns,
+                    ts_exchange=ts_exchange,
+                    condition_id=ticker,
+                    asset_id=ticker,
+                    reason=GapReason.MISSING_SNAPSHOT,
+                    details="Kalshi delta arrived before a trusted snapshot",
+                    seq_or_hash=seq,
+                ),
+            )
+            if missing_snapshot
+            else ()
+        )
 
         if side == "yes":
             levels = self._yes_bids.setdefault(ticker, {})
             new_size = max(Decimal("0"), levels.get(price, Decimal("0")) + delta)
             levels[price] = new_size
             return (
+                *gaps,
                 _book_event(
                     ts_local_ns=ts_local_ns,
                     ts_monotonic_ns=ts_monotonic_ns,
@@ -280,6 +314,7 @@ class KalshiNormalizer:
             new_size = max(Decimal("0"), levels.get(price, Decimal("0")) + delta)
             levels[price] = new_size
             return (
+                *gaps,
                 _book_event(
                     ts_local_ns=ts_local_ns,
                     ts_monotonic_ns=ts_monotonic_ns,
@@ -308,10 +343,59 @@ class KalshiNormalizer:
             ts_exchange=_optional_str(message.get("ts_ms")) or _optional_str(message.get("ts")),
             condition_id=ticker,
             asset_id=ticker,
-            price=parse_decimal(message["yes_price_dollars"]),
-            size=parse_decimal(message["count_fp"]),
+            price=_parse_probability_price(message["yes_price_dollars"]),
+            size=parse_decimal(_first_present(message, "count_fp", "count")),
             taker_side=_kalshi_taker_side(taker_side),
             trade_id=_required_str(message, "trade_id"),
+        )
+
+    def _sequence_gaps(
+        self,
+        payload: Mapping[str, object],
+        ticker: str | None,
+        ts_local_ns: int,
+        ts_monotonic_ns: int | None,
+    ) -> tuple[GapEvent, ...]:
+        sequence = _optional_int(payload.get("seq"))
+        if sequence is None:
+            return ()
+        key = _optional_str(payload.get("sid")) or ticker
+        if key is None:
+            return ()
+        previous = self._last_sequence.get(key)
+        self._last_sequence[key] = max(sequence, previous or sequence)
+        if previous is None or sequence <= previous + 1:
+            return ()
+        condition_id = ticker or "unknown"
+        return (
+            GapEvent(
+                ts_local_ns=ts_local_ns,
+                ts_monotonic_ns=ts_monotonic_ns,
+                ts_exchange=None,
+                condition_id=condition_id,
+                asset_id=ticker,
+                reason=GapReason.SEQUENCE_GAP,
+                details=f"Kalshi sequence jumped from {previous} to {sequence}",
+                seq_or_hash=str(sequence),
+            ),
+        )
+
+    def _reconnect_gap(
+        self,
+        message: Mapping[str, object],
+        ts_local_ns: int,
+        ts_monotonic_ns: int | None,
+    ) -> GapEvent:
+        ticker = _required_str(message, "market_ticker")
+        return GapEvent(
+            ts_local_ns=ts_local_ns,
+            ts_monotonic_ns=ts_monotonic_ns,
+            ts_exchange=None,
+            condition_id=ticker,
+            asset_id=ticker,
+            reason=GapReason.RECONNECT,
+            details="Kalshi snapshot received; local book state resynchronized",
+            seq_or_hash=_optional_str(message.get("market_id")),
         )
 
 
@@ -408,8 +492,15 @@ def _levels(value: object) -> tuple[tuple[Decimal, Decimal], ...]:
             raise TypeError("Kalshi orderbook level must be a price/size pair")
         if len(item) != 2:
             raise ValueError("Kalshi orderbook level must contain price and size")
-        levels.append((parse_decimal(item[0]), parse_decimal(item[1])))
+        levels.append((_parse_probability_price(item[0]), parse_decimal(item[1])))
     return tuple(levels)
+
+
+def _parse_probability_price(value: object) -> Decimal:
+    price = parse_decimal(value)
+    if price > Decimal("1"):
+        return price / Decimal("100")
+    return price
 
 
 def _kalshi_taker_side(value: str | None) -> str | None:
@@ -439,6 +530,26 @@ def _required_str(message: Mapping[str, object], key: str) -> str:
     if value is None:
         raise KeyError(key)
     return value
+
+
+def _first_present(message: Mapping[str, object], *keys: str) -> object:
+    for key in keys:
+        value = message.get(key)
+        if value is not None:
+            return value
+    raise KeyError(keys[0])
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError("boolean is not a valid sequence")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value)
+    raise TypeError(f"expected int-compatible value, got {type(value).__name__}")
 
 
 def _optional_str(value: object) -> str | None:

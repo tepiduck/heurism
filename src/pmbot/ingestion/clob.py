@@ -191,7 +191,7 @@ class MarketDataIngestor:
             self._recorder.flush_all()
             return
 
-        for payload in payloads:
+        for token_id, payload in zip(self._token_ids, payloads, strict=False):
             events = [
                 event
                 for event in self._processor.process_payload(payload)
@@ -202,7 +202,9 @@ class MarketDataIngestor:
                 event.condition_id
                 for event in events
                 if isinstance(event, (BookEvent, GapEvent))
-            } or {"unknown"}
+            }
+            if not condition_ids:
+                condition_ids = {"unknown"}
             for condition_id in condition_ids:
                 self._recorder.record(
                     self._processor.connection_gap(

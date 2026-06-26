@@ -24,8 +24,15 @@ class ForecastObservation:
     market_id: str
     ts_local_ns: int
     model_probability: Decimal
-    market_probability: Decimal
+    market_mid: Decimal
     realized: int
+    event_id: str | None = None
+    executable_price: Decimal | None = None
+
+    @property
+    def market_probability(self) -> Decimal:
+        """Backward-compatible alias for the non-executable market mid baseline."""
+        return self.market_mid
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +45,7 @@ class CrossVenueEvaluationObservation:
     kalshi_probability: Decimal
     realized: int
     pnl: Decimal = Decimal("0")
+    event_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +61,7 @@ class ScoreSummary:
     """Proper scoring summary against the market-price baseline."""
 
     n: int
+    distinct_event_count: int
     brier_model: float
     brier_market: float
     brier_skill: float
@@ -60,6 +69,7 @@ class ScoreSummary:
     log_loss_model: float
     log_loss_market: float
     brier_skill_ci: BootstrapInterval | None = None
+    brier_difference_ci: BootstrapInterval | None = None
     small_n: bool = False
 
 
@@ -169,6 +179,18 @@ class SweepResult:
 
 
 @dataclass(frozen=True, slots=True)
+class VerdictSummary:
+    """Dual go/no-go verdict from held-out proper scoring and actual-fill PnL."""
+
+    proper_score_positive: bool
+    pnl_positive: bool
+    go: bool
+    net_pnl: Decimal
+    net_pnl_ci: BootstrapInterval | None
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class EvaluationReport:
     """Complete WP-4 fixture report."""
 
@@ -178,4 +200,5 @@ class EvaluationReport:
     shortfall: ShortfallSummary
     sweep: SweepResult
     clv: ClvSummary | None
+    verdict: VerdictSummary
     headline: str

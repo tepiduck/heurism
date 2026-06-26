@@ -34,8 +34,9 @@ def forecast_with_candidate(
         market_id=observation.market_id,
         ts_local_ns=observation.ts_local_ns,
         model_probability=_clamp_probability(adjusted),
-        market_probability=observation.polymarket_probability,
+        market_mid=observation.polymarket_probability,
         realized=observation.realized,
+        event_id=observation.event_id,
     )
 
 

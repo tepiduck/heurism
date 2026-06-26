@@ -127,6 +127,28 @@ def test_marketable_order_walks_depth_with_slippage_and_depth_cap() -> None:
     assert all(fill.liquidity == LiquidityFlag.TAKER for fill in result.blotter)
 
 
+def test_marketable_limit_remainder_rests_with_conservative_queue_position() -> None:
+    order = OrderRequest(
+        asset_id=ASSET_ID,
+        side=OrderSide.BUY,
+        size=Decimal("10"),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("0.55"),
+    )
+    events = [
+        *snapshot(BASE_TS, bids=[("0.49", "20")], asks=[("0.51", "5")]),
+        trade(BASE_TS + 1, price="0.55", size="3", taker_side="sell", trade_id="ahead"),
+        trade(BASE_TS + 2, price="0.55", size="4", taker_side="sell", trade_id="partial"),
+    ]
+
+    result = zero_cost_engine().run(events, EmitOnce(order))
+
+    assert [fill.size for fill in result.blotter] == [Decimal("5"), Decimal("2")]
+    assert result.blotter[0].liquidity == LiquidityFlag.TAKER
+    assert result.blotter[1].liquidity == LiquidityFlag.MAKER
+    assert result.blotter[1].source_trade_id == "partial"
+
+
 def test_latency_fills_against_arrival_book_not_decision_book() -> None:
     order = OrderRequest(
         asset_id=ASSET_ID,
@@ -314,6 +336,48 @@ def test_liquidation_marking_values_long_below_mid_by_half_spread() -> None:
     assert mid.pnl_series[-1].mark_to_market - liquidation.pnl_series[-1].mark_to_market == Decimal(
         "1.00"
     )
+
+
+def test_missing_liquidation_side_invalidates_mark_instead_of_marking_to_zero() -> None:
+    long_order = OrderRequest(
+        asset_id=ASSET_ID,
+        side=OrderSide.BUY,
+        size=Decimal("1"),
+        order_type=OrderType.MARKET,
+    )
+    short_order = OrderRequest(
+        asset_id=ASSET_ID,
+        side=OrderSide.SELL,
+        size=Decimal("1"),
+        order_type=OrderType.MARKET,
+    )
+    long_events = [
+        *snapshot(BASE_TS, bids=[("0.49", "20")], asks=[("0.50", "10")]),
+        *delta(BASE_TS + 1, bids=[("0.49", "0")]),
+    ]
+    short_events = [
+        *snapshot(BASE_TS, bids=[("0.49", "20")], asks=[("0.50", "10")]),
+        *delta(BASE_TS + 1, asks=[("0.50", "0")]),
+    ]
+
+    long_result = zero_cost_engine(marking_mode=MarkingMode.LIQUIDATION).run(
+        long_events,
+        EmitOnce(long_order),
+    )
+    short_result = zero_cost_engine(marking_mode=MarkingMode.LIQUIDATION).run(
+        short_events,
+        EmitOnce(short_order),
+    )
+    mid_result = zero_cost_engine(marking_mode=MarkingMode.MID).run(
+        long_events,
+        EmitOnce(long_order),
+    )
+
+    assert long_result.pnl_series[-1].pnl_valid is False
+    assert short_result.pnl_series[-1].pnl_valid is False
+    assert mid_result.pnl_series[-1].pnl_valid is False
+    assert long_result.pnl_series[-1].mark_to_market == Decimal("-0.50")
+    assert short_result.pnl_series[-1].mark_to_market == Decimal("0.49")
 
 
 def test_deterministic_replay_produces_identical_blotters() -> None:

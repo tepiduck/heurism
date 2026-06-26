@@ -129,9 +129,19 @@ class CollectorStateStore:
         self.save()
 
     def _load(self) -> CollectorStatus | None:
-        if not self._path.exists():
-            return None
-        payload = json.loads(self._path.read_text(encoding="utf-8"))
+        return _load_status_path(self._path)
+
+
+def load_status(data_dir: Path) -> CollectorStatus | None:
+    """Load status without mutating it."""
+    return _load_status_path(data_dir / STATUS_RELATIVE_PATH)
+
+
+def _load_status_path(path: Path) -> CollectorStatus | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return None
         venues = tuple(
@@ -152,34 +162,8 @@ class CollectorStateStore:
             resolutions_collected=int(payload["resolutions_collected"]),
             venues=venues,
         )
-
-
-def load_status(data_dir: Path) -> CollectorStatus | None:
-    """Load status without mutating it."""
-    path = data_dir / STATUS_RELATIVE_PATH
-    if not path.exists():
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        return None
-    venues = tuple(
-        VenueStatus(
-            venue=str(item["venue"]),
-            last_frame_ns=item["last_frame_ns"],
-            frames_total=int(item["frames_total"]),
-            reconnects=int(item["reconnects"]),
-            gap_timestamps_ns=tuple(int(value) for value in item["gap_timestamps_ns"]),
-        )
-        for item in payload.get("venues", [])
-        if isinstance(item, dict)
-    )
-    return CollectorStatus(
-        started_at_ns=int(payload["started_at_ns"]),
-        updated_at_ns=int(payload["updated_at_ns"]),
-        pairs_tracked=int(payload["pairs_tracked"]),
-        resolutions_collected=int(payload["resolutions_collected"]),
-        venues=venues,
-    )
 
 
 def render_status(status: CollectorStatus | None, *, now_ns: int | None = None) -> str:

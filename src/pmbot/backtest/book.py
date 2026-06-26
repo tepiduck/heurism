@@ -50,12 +50,17 @@ class OrderBookState:
         )
         return BookSnapshot(asset_id=asset_id, bids=bids, asks=asks)
 
-    def queue_ahead(self, order: OrderRequest) -> Decimal:
+    def queue_ahead(
+        self,
+        order: OrderRequest,
+        *,
+        synthetic_ahead: Decimal = Decimal("0"),
+    ) -> Decimal:
         """Displayed size ahead of a newly resting order at its limit level."""
         if order.limit_price is None:
-            return Decimal("0")
+            return synthetic_ahead
         levels = self._bids if order.side == OrderSide.BUY else self._asks
-        return levels.get(order.asset_id, {}).get(order.limit_price, Decimal("0"))
+        return levels.get(order.asset_id, {}).get(order.limit_price, Decimal("0")) + synthetic_ahead
 
     def is_marketable(self, order: OrderRequest) -> bool:
         """Return whether an order crosses current displayed depth."""
