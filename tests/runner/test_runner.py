@@ -12,10 +12,11 @@ from pmbot.ingestion.schemas import (
     BookSide,
     GapEvent,
     GapReason,
+    MetadataSnapshot,
     TradeEvent,
 )
 from pmbot.runner.allowlist import load_verified_pairs
-from pmbot.runner.collector import _record_startup_resolutions
+from pmbot.runner.collector import _record_startup_resolutions, _tracked_polymarket_metadata
 from pmbot.runner.models import CollectorStatus, ResolutionRecord, VenueStatus
 from pmbot.runner.orchestrator import CollectorOrchestrator
 from pmbot.runner.resolutions import ResolutionPoller, StaticResolutionSource
@@ -338,6 +339,15 @@ def test_signal_logging_infers_venue_for_unmapped_polymarket_no_token(tmp_path) 
     assert len(venues["kalshi"].gap_timestamps_ns) == 1
 
 
+def test_polymarket_metadata_filter_keeps_only_tracked_markets() -> None:
+    snapshots = (
+        runner_metadata("pm-condition"),
+        runner_metadata("scanned-only-condition"),
+    )
+
+    assert _tracked_polymarket_metadata(snapshots, (PAIR,)) == (snapshots[0],)
+
+
 def test_resolution_poller_is_idempotent(tmp_path) -> None:
     async def run() -> None:
         record = ResolutionRecord(
@@ -552,6 +562,22 @@ def trade_event(ts_local_ns: int, trade_id: str) -> TradeEvent:
         size=Decimal("1"),
         taker_side="buy",
         trade_id=trade_id,
+    )
+
+
+def runner_metadata(condition_id: str) -> MetadataSnapshot:
+    return MetadataSnapshot(
+        fetched_at="2026-06-24T00:00:00Z",
+        condition_id=condition_id,
+        question="Fixture?",
+        outcomes=("Yes", "No"),
+        token_ids=("yes", "no"),
+        resolution_or_end_time=None,
+        active=True,
+        closed=False,
+        liquidity=None,
+        volume=None,
+        raw_json=json.dumps({"conditionId": condition_id}),
     )
 
 

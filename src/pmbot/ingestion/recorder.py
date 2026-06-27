@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -29,6 +30,48 @@ from pmbot.ingestion.schemas import (
 T = TypeVar("T")
 DEFAULT_RECORDER_BUFFER_SIZE = 10_000
 DEFAULT_MAX_RECORDED_DEPTH = 10
+METADATA_RAW_JSON_KEYS = frozenset(
+    {
+        "__event_end_date",
+        "__event_slug",
+        "__event_title",
+        "acceptingOrders",
+        "active",
+        "clobTokenIds",
+        "closed",
+        "conditionId",
+        "condition_id",
+        "endDate",
+        "endDateIso",
+        "eventSlug",
+        "eventTitle",
+        "event_slug",
+        "expiration_time",
+        "expected_expiration_time",
+        "expiration_value",
+        "groupItemTitle",
+        "market",
+        "outcome",
+        "outcomes",
+        "question",
+        "resolution",
+        "resolutionTime",
+        "resolvedOutcome",
+        "resolved_outcome",
+        "result",
+        "slug",
+        "status",
+        "subtitle",
+        "ticker",
+        "title",
+        "token_ids",
+        "umaEndDate",
+        "umaEndDateIso",
+        "winner",
+        "winningOutcome",
+        "yes_sub_title",
+    }
+)
 
 
 BOOK_SCHEMA: pl.Schema = pl.Schema(
@@ -125,6 +168,7 @@ class ParquetRecorder:
             if max_recorded_depth is None or max_recorded_depth <= 0
             else _BookDepthWriteFilter(max_recorded_depth)
         )
+        self._metadata_filter = _MetadataSnapshotWriteFilter()
 
     def record(self, event: NormalizedEvent) -> None:
         """Record one event and flush if size/time thresholds are met."""
@@ -174,9 +218,31 @@ class ParquetRecorder:
 
     def _writable_events(self, events: Iterable[NormalizedEvent]) -> tuple[NormalizedEvent, ...]:
         event_tuple = tuple(events)
-        if self._depth_filter is None:
-            return event_tuple
-        return self._depth_filter.filter(event_tuple)
+        writable = (
+            event_tuple if self._depth_filter is None else self._depth_filter.filter(event_tuple)
+        )
+        return self._metadata_filter.filter(writable)
+
+
+class _MetadataSnapshotWriteFilter:
+    """Suppress unchanged metadata snapshots within a recorder process."""
+
+    def __init__(self) -> None:
+        self._hash_by_condition: dict[str, str] = {}
+
+    def filter(self, events: Sequence[NormalizedEvent]) -> tuple[NormalizedEvent, ...]:
+        writable: list[NormalizedEvent] = []
+        for event in events:
+            if not isinstance(event, MetadataSnapshot):
+                writable.append(event)
+                continue
+            condition_id = _condition_for_event(event)
+            content_hash = _metadata_content_hash(event)
+            if self._hash_by_condition.get(condition_id) == content_hash:
+                continue
+            self._hash_by_condition[condition_id] = content_hash
+            writable.append(event)
+        return tuple(writable)
 
 
 class _BookDepthWriteFilter:
@@ -363,8 +429,31 @@ def _metadata_row(event: MetadataSnapshot) -> dict[str, object]:
         "closed": event.closed,
         "liquidity": event.liquidity,
         "volume": event.volume,
-        "raw_json": event.raw_json,
+        "raw_json": _trim_metadata_raw_json(event.raw_json),
     }
+
+
+def _metadata_content_hash(event: MetadataSnapshot) -> str:
+    row = _metadata_row(event)
+    row.pop("fetched_at", None)
+    payload = json.dumps(row, default=str, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _trim_metadata_raw_json(raw_json: str) -> str:
+    """Persist only metadata keys needed for historical pair reconstruction."""
+    try:
+        decoded = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(decoded, dict):
+        return ""
+    compact = {
+        key: value
+        for key, value in decoded.items()
+        if key in METADATA_RAW_JSON_KEYS and value is not None
+    }
+    return json.dumps(compact, default=str, separators=(",", ":"), sort_keys=True)
 
 
 def _stream_for_event(event: NormalizedEvent) -> str:

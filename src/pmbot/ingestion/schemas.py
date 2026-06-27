@@ -44,7 +44,8 @@ Gamma metadata stream:
 ``data/raw/metadata/date=YYYY-MM-DD/market={condition_id}/``
     fetched_at: ISO-8601 UTC timestamp for the Gamma snapshot
     condition_id, question, outcomes, token_ids, resolution_or_end_time,
-    active, closed, liquidity, volume, raw_json
+    active, closed, liquidity, volume, raw_json. The raw_json column is a compact
+    reconstruction subset, not the full venue payload.
 """
 
 from __future__ import annotations

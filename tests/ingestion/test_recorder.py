@@ -1,10 +1,11 @@
+import json
 from datetime import date
 from decimal import Decimal
 
 import polars as pl
 
 from pmbot.ingestion.recorder import ParquetRecorder
-from pmbot.ingestion.schemas import BookEvent, BookEventType, BookSide
+from pmbot.ingestion.schemas import BookEvent, BookEventType, BookSide, MetadataSnapshot
 
 
 def test_recorder_round_trip_preserves_decimal_schema_and_values(tmp_path) -> None:
@@ -102,6 +103,44 @@ def test_recorder_caps_book_depth_and_emits_boundary_deltas(tmp_path) -> None:
     ]
 
 
+def test_recorder_writes_metadata_only_when_content_changes_and_trims_raw_json(tmp_path) -> None:
+    recorder = ParquetRecorder(
+        data_dir=tmp_path,
+        buffer_size=100,
+        flush_interval_seconds=999,
+        partition_date=lambda: date(2026, 6, 24),
+    )
+
+    recorder.record_many(
+        [
+            metadata_snapshot(fetched_at="2026-06-24T00:00:00Z"),
+            metadata_snapshot(fetched_at="2026-06-24T00:01:00Z"),
+        ]
+    )
+    recorder.flush_all()
+
+    files = list(
+        (tmp_path / "raw" / "metadata" / "date=2026-06-24" / "market=condition-1").glob(
+            "*.parquet"
+        )
+    )
+    frame = pl.read_parquet(files)
+    raw_json = json.loads(frame["raw_json"][0])
+
+    assert len(frame) == 1
+    assert frame["fetched_at"].to_list() == ["2026-06-24T00:00:00Z"]
+    assert raw_json == {
+        "acceptingOrders": True,
+        "active": True,
+        "clobTokenIds": ["asset-yes", "asset-no"],
+        "closed": False,
+        "conditionId": "condition-1",
+        "outcomes": ["Yes", "No"],
+        "question": "Will Example win?",
+        "slug": "fifwc-aaa-bbb-2026-06-24-aaa",
+    }
+
+
 def book_event(
     asset_id: str,
     side: BookSide,
@@ -122,4 +161,33 @@ def book_event(
         price=Decimal(price),
         size=Decimal(size),
         seq_or_hash=seq,
+    )
+
+
+def metadata_snapshot(*, fetched_at: str) -> MetadataSnapshot:
+    raw_json = json.dumps(
+        {
+            "acceptingOrders": True,
+            "active": True,
+            "clobTokenIds": ["asset-yes", "asset-no"],
+            "closed": False,
+            "conditionId": "condition-1",
+            "debugBlob": "x" * 10_000,
+            "outcomes": ["Yes", "No"],
+            "question": "Will Example win?",
+            "slug": "fifwc-aaa-bbb-2026-06-24-aaa",
+        }
+    )
+    return MetadataSnapshot(
+        fetched_at=fetched_at,
+        condition_id="condition-1",
+        question="Will Example win?",
+        outcomes=("Yes", "No"),
+        token_ids=("asset-yes", "asset-no"),
+        resolution_or_end_time=None,
+        active=True,
+        closed=False,
+        liquidity=Decimal("1"),
+        volume=Decimal("2"),
+        raw_json=raw_json,
     )

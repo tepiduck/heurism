@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from pmbot.ingestion.kalshi import (
     kalshi_subscribe_message,
     kalshi_websocket_headers,
 )
+from pmbot.ingestion.schemas import MetadataSnapshot
 from pmbot.runner.allowlist import load_verified_pairs
 from pmbot.runner.compaction import RawDataCompactionTask
 from pmbot.runner.models import ResolutionRecord
@@ -239,7 +241,10 @@ class PolymarketVenueTask:
         if not pairs:
             await self._registry.wait_for_change(version)
             return
-        snapshots = await self._gamma.fetch_all_active_markets()
+        snapshots = _tracked_polymarket_metadata(
+            await self._gamma.fetch_all_active_markets(),
+            pairs,
+        )
         self._recorder.record_many(snapshots)
         self._recorder.flush_all()
         ingestor = MarketDataIngestor(
@@ -367,6 +372,15 @@ async def _run_until_registry_change(
             task.cancel()
         change_task.cancel()
         await asyncio.gather(task, change_task, return_exceptions=True)
+
+
+def _tracked_polymarket_metadata(
+    snapshots: Sequence[MetadataSnapshot],
+    pairs: Sequence[VerifiedContractPair],
+) -> tuple[MetadataSnapshot, ...]:
+    """Keep only metadata for markets the collector is actively tracking."""
+    tracked_conditions = {pair.polymarket_condition_id for pair in pairs}
+    return tuple(snapshot for snapshot in snapshots if snapshot.condition_id in tracked_conditions)
 
 
 def _url_or_default(value: object, default: str) -> str:
