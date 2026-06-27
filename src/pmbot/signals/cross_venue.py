@@ -598,6 +598,10 @@ def _kalshi_leg(ticker: str) -> str:
 
 
 def _quote_clock(view: PointInTimeView, asset_id: str) -> _QuoteClock | None:
+    clock = view.quote_clock(asset_id)
+    if clock is not None and clock.bid_ns is not None and clock.ask_ns is not None:
+        return _QuoteClock(bid_ns=clock.bid_ns, ask_ns=clock.ask_ns)
+
     bid_ns: int | None = None
     ask_ns: int | None = None
     for event in view.events():

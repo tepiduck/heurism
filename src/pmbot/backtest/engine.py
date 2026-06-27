@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
@@ -42,6 +43,15 @@ class BacktestConfig:
     costs: CostConfig = field(default_factory=CostConfig)
     marking_mode: MarkingMode = MarkingMode.LIQUIDATION
     allow_zero_costs: bool = False
+    retain_event_history: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteClock:
+    """Latest exchange timestamps seen for an asset's bid and ask."""
+
+    bid_ns: int | None
+    ask_ns: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +73,7 @@ class PointInTimeView:
     _events: tuple[ReplayEvent, ...]
     _gap_active_assets: frozenset[str]
     _gap_active_all: bool
+    _quote_clocks: Mapping[str, QuoteClock]
 
     def book(self, asset_id: str) -> BookSnapshot:
         """Return current book state as of ``ts_local_ns``."""
@@ -96,6 +107,10 @@ class PointInTimeView:
         """Return whether the asset is inside an untrusted gap span."""
         return self._gap_active_all or asset_id in self._gap_active_assets
 
+    def quote_clock(self, asset_id: str) -> QuoteClock | None:
+        """Return latest bid/ask exchange timestamps for one asset."""
+        return self._quote_clocks.get(asset_id)
+
 
 class BacktestEngine:
     """Replay normalized events and simulate conservative fills."""
@@ -112,25 +127,41 @@ class BacktestEngine:
 
     def run(self, events: Iterable[ReplayEvent], strategy: StrategyCallback) -> BacktestResult:
         """Run a deterministic event-driven replay."""
+        return self.run_sorted(merge_events(events), strategy)
+
+    def run_sorted(
+        self,
+        events: Iterable[ReplayEvent],
+        strategy: StrategyCallback,
+        *,
+        progress: Callable[[int, int | None, int], None] | None = None,
+        total_events: int | None = None,
+    ) -> BacktestResult:
+        """Run replay from an already sorted event stream."""
         state = _ReplayState(
             cost_model=self._cost_model,
             marking_mode=self._config.marking_mode,
+            retain_event_history=self._config.retain_event_history,
         )
-        replay_events = merge_events(events)
-        index = 0
-        while index < len(replay_events):
-            event_ts = replay_events[index].ts_local_ns
-            state.process_arrivals_until(event_ts)
-            same_ts: list[ReplayEvent] = []
-            while index < len(replay_events) and replay_events[index].ts_local_ns == event_ts:
-                same_ts.append(replay_events[index])
-                index += 1
-            for event in same_ts:
-                state.apply_event(event)
-            view = state.view(event_ts)
-            for request in strategy(view):
-                state.schedule_order(request, decision_ts_local_ns=event_ts, config=self._config)
-            state.mark(event_ts)
+        processed = 0
+        current_ts: int | None = None
+        same_ts: list[ReplayEvent] = []
+        for event in events:
+            if current_ts is None:
+                current_ts = event.ts_local_ns
+            if event.ts_local_ns != current_ts:
+                self._process_batch(state, current_ts, same_ts, strategy)
+                processed += len(same_ts)
+                if progress is not None:
+                    progress(processed, total_events, current_ts)
+                same_ts = []
+                current_ts = event.ts_local_ns
+            same_ts.append(event)
+        if current_ts is not None and same_ts:
+            self._process_batch(state, current_ts, same_ts, strategy)
+            processed += len(same_ts)
+            if progress is not None:
+                progress(processed, total_events, current_ts)
         state.process_arrivals_until(None)
         return BacktestResult(
             blotter=tuple(state.fills),
@@ -138,18 +169,41 @@ class BacktestEngine:
             pnl_valid=all(mark.pnl_valid for mark in state.pnl_series),
         )
 
+    def _process_batch(
+        self,
+        state: _ReplayState,
+        event_ts: int,
+        same_ts: Iterable[ReplayEvent],
+        strategy: StrategyCallback,
+    ) -> None:
+        state.process_arrivals_until(event_ts)
+        for event in same_ts:
+            state.apply_event(event)
+        view = state.view(event_ts)
+        for request in strategy(view):
+            state.schedule_order(request, decision_ts_local_ns=event_ts, config=self._config)
+        state.mark(event_ts)
+
 
 class _ReplayState:
-    def __init__(self, *, cost_model: CostModel, marking_mode: MarkingMode) -> None:
+    def __init__(
+        self,
+        *,
+        cost_model: CostModel,
+        marking_mode: MarkingMode,
+        retain_event_history: bool,
+    ) -> None:
         self.book = OrderBookState()
         self.cost_model = cost_model
         self.marking_mode = marking_mode
+        self.retain_event_history = retain_event_history
         self.pending: list[PendingOrder] = []
         self.resting: list[RestingOrder] = []
         self.fills: list[Fill] = []
         self.pnl_series: list[PositionMark] = []
         self.trades: list[TradeEvent] = []
         self.events: list[ReplayEvent] = []
+        self.quote_clocks: dict[str, QuoteClock] = {}
         self.gap_assets: set[str] = set()
         self.gap_conditions: set[str] = set()
         self.cash = Decimal("0")
@@ -176,13 +230,15 @@ class _ReplayState:
             self._apply_gap(event)
         elif isinstance(event, BookEvent):
             self.book.apply(event)
+            self._apply_quote_clock(event)
             if event.event_type == BookEventType.SNAPSHOT:
                 self.gap_assets.discard(event.asset_id)
                 self.gap_conditions.discard(event.condition_id)
         elif isinstance(event, TradeEvent):
             self.trades.append(event)
             self._fill_resting_from_trade(event)
-        self.events.append(event)
+        if self.retain_event_history:
+            self.events.append(event)
 
     def view(self, ts_local_ns: int) -> PointInTimeView:
         """Create a point-in-time strategy view."""
@@ -193,7 +249,28 @@ class _ReplayState:
             _events=tuple(self.events),
             _gap_active_assets=frozenset(self.gap_assets),
             _gap_active_all=bool(self.gap_conditions),
+            _quote_clocks=dict(self.quote_clocks),
         )
+
+    def _apply_quote_clock(self, event: BookEvent) -> None:
+        ts_exchange_ns = _parse_exchange_time_ns(event.ts_exchange)
+        if ts_exchange_ns is None:
+            return
+        current = self.quote_clocks.get(event.asset_id, QuoteClock(None, None))
+        if event.side.value == "bid":
+            bid_ns = (
+                ts_exchange_ns
+                if current.bid_ns is None
+                else max(current.bid_ns, ts_exchange_ns)
+            )
+            self.quote_clocks[event.asset_id] = QuoteClock(bid_ns, current.ask_ns)
+        elif event.side.value == "ask":
+            ask_ns = (
+                ts_exchange_ns
+                if current.ask_ns is None
+                else max(current.ask_ns, ts_exchange_ns)
+            )
+            self.quote_clocks[event.asset_id] = QuoteClock(current.bid_ns, ask_ns)
 
     def schedule_order(
         self,
@@ -381,6 +458,27 @@ class _ReplayState:
 
     def _gap_active(self, asset_id: str) -> bool:
         return asset_id in self.gap_assets or bool(self.gap_conditions)
+
+
+def _parse_exchange_time_ns(value: str | None) -> int | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        pass
+    iso_value = stripped.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    parsed_utc = parsed.astimezone(UTC)
+    return int(parsed_utc.timestamp()) * 1_000_000_000 + parsed_utc.microsecond * 1_000
 
 
 def _trade_reaches_order(order: RestingOrder, trade: TradeEvent) -> bool:

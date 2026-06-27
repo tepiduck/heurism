@@ -28,6 +28,12 @@ Produce a WP-4 preliminary edge read from recorded raw books and resolutions:
 pmbot eval --data-dir data --report out.json
 ```
 
+For large archives, score a bounded window:
+
+```bash
+pmbot eval --data-dir data --report out.json --hours 6
+```
+
 The eval runner replays `data/raw/book` through the current cross-venue signal
 code and joins the recomputed p-hat series to `data/resolutions`. It does not
 read `data/signals`, because that history can mix model versions. The JSON

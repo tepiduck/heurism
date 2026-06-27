@@ -1,6 +1,8 @@
 """Command-line interface for pmbot."""
 
 import asyncio
+import logging
+import time
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -294,6 +296,14 @@ def eval_command(
             help="Optional inclusive ts_local_ns upper bound for raw book replay.",
         ),
     ] = None,
+    hours: Annotated[
+        float | None,
+        typer.Option(
+            "--hours",
+            min=0.001,
+            help="Convenience recent-window size. Uses end-ns or now as the window end.",
+        ),
+    ] = None,
     bootstrap_samples: Annotated[
         int,
         typer.Option(
@@ -373,13 +383,21 @@ def eval_command(
     ] = True,
 ) -> None:
     """Score recomputed cross-venue p_hat from raw recorded books."""
+    if hours is not None and start_ns is not None:
+        raise typer.BadParameter("--hours cannot be combined with --start-ns")
+    effective_end_ns = end_ns
+    effective_start_ns = start_ns
+    if hours is not None:
+        effective_end_ns = end_ns or time.time_ns()
+        effective_start_ns = effective_end_ns - int(hours * 3_600_000_000_000)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     payload = run_eval(
         EvalRunConfig(
             data_dir=data_dir,
             report_path=report,
             allowlist_path=allowlist,
-            start_ns=start_ns,
-            end_ns=end_ns,
+            start_ns=effective_start_ns,
+            end_ns=effective_end_ns,
             bootstrap_samples=bootstrap_samples,
             calibration_bins=calibration_bins,
             max_bid_ask_spread=_optional_decimal(max_bid_ask_spread),

@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -24,6 +25,7 @@ def test_eval_runner_recomputes_signals_from_raw_books_and_writes_manifest(tmp_p
     write_books(
         tmp_path,
         [
+            *snapshot(BASE_TS - 100, "pm-good", "pm-good-yes", bid="0.10", ask="0.20"),
             *snapshot(BASE_TS, "pm-good", "pm-good-yes", bid="0.49", ask="0.51"),
             *snapshot(
                 BASE_TS + 1,
@@ -31,6 +33,13 @@ def test_eval_runner_recomputes_signals_from_raw_books_and_writes_manifest(tmp_p
                 "KXWCGAME-26JUN25GOOD-GOD",
                 bid="0.79",
                 ask="0.81",
+            ),
+            *snapshot(
+                BASE_TS + 100,
+                "KXWCGAME-26JUN25GOOD-GOD",
+                "KXWCGAME-26JUN25GOOD-GOD",
+                bid="0.10",
+                ask="0.20",
             ),
         ],
     )
@@ -41,6 +50,8 @@ def test_eval_runner_recomputes_signals_from_raw_books_and_writes_manifest(tmp_p
             data_dir=tmp_path,
             report_path=report,
             allowlist_path=allowlist,
+            start_ns=BASE_TS,
+            end_ns=BASE_TS + 1,
             bootstrap_samples=10,
             calibration_bins=5,
             fit_regression=True,
@@ -146,7 +157,12 @@ def test_eval_runner_flags_guards_without_silently_dropping_context(tmp_path) ->
 
 
 def write_books(tmp_path, events: list[BookEvent]) -> None:
-    recorder = ParquetRecorder(data_dir=tmp_path, buffer_size=100, flush_interval_seconds=999)
+    recorder = ParquetRecorder(
+        data_dir=tmp_path,
+        buffer_size=100,
+        flush_interval_seconds=999,
+        partition_date=lambda: datetime.fromtimestamp(BASE_TS / 1_000_000_000, UTC).date(),
+    )
     recorder.record_many(events)
     recorder.flush_all()
 

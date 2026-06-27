@@ -155,6 +155,7 @@ class SignalEventObserver:
             _events=tuple(self._events),
             _gap_active_assets=frozenset(self._gap_assets),
             _gap_active_all=bool(self._gap_conditions),
+            _quote_clocks={},
         )
         for pair_key in sorted(pair_keys):
             signal = self._signals_by_pair.get(pair_key)

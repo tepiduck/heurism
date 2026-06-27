@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -45,6 +46,19 @@ from pmbot.signals.cross_venue import (
 DEFAULT_ALLOWLIST_PATH = Path("pairs.draft.jsonl")
 DEFAULT_KNOCKOUT_START_DATE = date(2026, 7, 1)
 DEFAULT_SMALL_N_THRESHOLD = 30
+BOOK_REPLAY_COLUMNS = (
+    "ts_local_ns",
+    "ts_monotonic_ns",
+    "ts_exchange",
+    "condition_id",
+    "asset_id",
+    "event_type",
+    "side",
+    "price",
+    "size",
+    "seq_or_hash",
+)
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,15 +110,6 @@ class EvalRunConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class EvalSignalSample:
-    """One recomputed signal plus eval-only guard annotations."""
-
-    value: SignalValue
-    pair: VerifiedContractPair
-    guard_reasons: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class EvalObservationDecision:
     """One recomputed forecast and whether it entered scoring."""
 
@@ -129,6 +134,17 @@ class EvalMetrics:
     regression_fit: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class RawReplayData:
+    """Vectorized raw book replay input."""
+
+    frame: pl.DataFrame
+    row_count: int
+    start_ns: int
+    end_ns: int
+    files_scanned: int
+
+
 def run_eval(config: EvalRunConfig) -> dict[str, object]:
     """Run WP-4 evaluation from raw books and write an immutable JSON report."""
     if config.report_path.exists():
@@ -136,12 +152,16 @@ def run_eval(config: EvalRunConfig) -> dict[str, object]:
     pairs = load_verified_pairs(config.allowlist_path)
     if not pairs:
         raise ValueError(f"no verified pairs loaded from {config.allowlist_path}")
-    events = _load_raw_replay_events(config)
-    if not events:
+    replay = _load_raw_replay_data(config)
+    if replay.row_count == 0:
         raise ValueError(f"no raw replay events found under {config.data_dir / 'raw'}")
     outcomes = _load_resolution_outcomes(config.data_dir)
-    samples = _recompute_signal_samples(events=events, pairs=pairs, config=config)
-    decisions = _decide_observations(samples=samples, outcomes=outcomes, config=config)
+    decisions, signal_count = _recompute_observation_decisions(
+        replay=replay,
+        pairs=pairs,
+        outcomes=outcomes,
+        config=config,
+    )
     included = tuple(_forecast_observation(decision) for decision in decisions if decision.included)
     if not included:
         raise ValueError("no resolved, guard-passing observations available for scoring")
@@ -168,8 +188,8 @@ def run_eval(config: EvalRunConfig) -> dict[str, object]:
     payload = _manifest_payload(
         config=config,
         pairs=pairs,
-        events=events,
-        samples=samples,
+        replay=replay,
+        signal_count=signal_count,
         decisions=decisions,
         metrics=metrics,
     )
@@ -181,41 +201,120 @@ def run_eval(config: EvalRunConfig) -> dict[str, object]:
     return payload
 
 
-def _load_raw_replay_events(config: EvalRunConfig) -> tuple[BookEvent, ...]:
+def _load_raw_replay_data(config: EvalRunConfig) -> RawReplayData:
     """Load only raw book rows; do not read precomputed signal parquet."""
-    rows: list[dict[str, Any]] = []
     root = config.data_dir / "raw" / "book"
-    for path in sorted(root.glob("**/*.parquet")) if root.exists() else ():
-        frame = pl.read_parquet(path)
-        if config.start_ns is not None:
-            frame = frame.filter(pl.col("ts_local_ns") >= config.start_ns)
-        if config.end_ns is not None:
-            frame = frame.filter(pl.col("ts_local_ns") <= config.end_ns)
-        rows.extend(frame.to_dicts())
-    events = [
-        BookEvent(
-            ts_local_ns=int(row["ts_local_ns"]),
-            ts_monotonic_ns=_optional_int(row.get("ts_monotonic_ns")),
-            ts_exchange=_optional_str(row.get("ts_exchange")),
-            condition_id=str(row["condition_id"]),
-            asset_id=str(row["asset_id"]),
-            event_type=BookEventType(str(row["event_type"])),
-            side=BookSide(str(row["side"])),
-            price=_decimal(row["price"]),
-            size=_decimal(row["size"]),
-            seq_or_hash=_optional_str(row.get("seq_or_hash")),
+    files = _book_parquet_files(config)
+    if not files:
+        return RawReplayData(
+            frame=pl.DataFrame({column: [] for column in BOOK_REPLAY_COLUMNS}),
+            row_count=0,
+            start_ns=0,
+            end_ns=0,
+            files_scanned=0,
         )
-        for row in rows
-    ]
-    return tuple(sorted(events, key=lambda event: (event.ts_local_ns, event.asset_id, event.side)))
+
+    LOGGER.info("eval: scanning %s raw book parquet files under %s", len(files), root)
+    scan = pl.scan_parquet([str(path) for path in files]).select(BOOK_REPLAY_COLUMNS)
+    if config.start_ns is not None:
+        scan = scan.filter(pl.col("ts_local_ns") >= config.start_ns)
+    if config.end_ns is not None:
+        scan = scan.filter(pl.col("ts_local_ns") <= config.end_ns)
+    frame = scan.sort(["ts_local_ns", "asset_id", "side"]).collect(engine="streaming")
+    row_count = frame.height
+    if row_count == 0:
+        return RawReplayData(
+            frame=frame,
+            row_count=0,
+            start_ns=0,
+            end_ns=0,
+            files_scanned=len(files),
+        )
+    start_ns = _required_int(frame["ts_local_ns"].min())
+    end_ns = _required_int(frame["ts_local_ns"].max())
+    LOGGER.info(
+        "eval: loaded %s raw book rows from %s files (%s..%s)",
+        row_count,
+        len(files),
+        start_ns,
+        end_ns,
+    )
+    return RawReplayData(
+        frame=frame,
+        row_count=row_count,
+        start_ns=start_ns,
+        end_ns=end_ns,
+        files_scanned=len(files),
+    )
 
 
-def _recompute_signal_samples(
+def _iter_book_events(frame: pl.DataFrame) -> Iterable[BookEvent]:
+    for (
+        ts_local_ns,
+        ts_monotonic_ns,
+        ts_exchange,
+        condition_id,
+        asset_id,
+        event_type,
+        side,
+        price,
+        size,
+        seq_or_hash,
+    ) in frame.iter_rows(named=False):
+        yield BookEvent(
+            ts_local_ns=int(ts_local_ns),
+            ts_monotonic_ns=_optional_int(ts_monotonic_ns),
+            ts_exchange=_optional_str(ts_exchange),
+            condition_id=str(condition_id),
+            asset_id=str(asset_id),
+            event_type=BookEventType(str(event_type)),
+            side=BookSide(str(side)),
+            price=_decimal(price),
+            size=_decimal(size),
+            seq_or_hash=_optional_str(seq_or_hash),
+        )
+
+
+def _book_parquet_files(config: EvalRunConfig) -> tuple[Path, ...]:
+    root = config.data_dir / "raw" / "book"
+    if not root.exists():
+        return ()
+    start_date = _ns_to_utc_date(config.start_ns) if config.start_ns is not None else None
+    end_date = _ns_to_utc_date(config.end_ns) if config.end_ns is not None else None
+    files: list[Path] = []
+    for path in sorted(root.glob("date=*/market=*/*.parquet")):
+        partition_date = _date_partition(path)
+        if partition_date is not None:
+            if start_date is not None and partition_date < start_date:
+                continue
+            if end_date is not None and partition_date > end_date:
+                continue
+        files.append(path)
+    return tuple(files)
+
+
+def _ns_to_utc_date(value: int) -> date:
+    return datetime.fromtimestamp(value / 1_000_000_000, tz=UTC).date()
+
+
+def _date_partition(path: Path) -> date | None:
+    for part in path.parts:
+        if not part.startswith("date="):
+            continue
+        try:
+            return date.fromisoformat(part.removeprefix("date="))
+        except ValueError:
+            return None
+    return None
+
+
+def _recompute_observation_decisions(
     *,
-    events: tuple[BookEvent, ...],
+    replay: RawReplayData,
     pairs: tuple[VerifiedContractPair, ...],
+    outcomes: Mapping[tuple[str, str], int],
     config: EvalRunConfig,
-) -> tuple[EvalSignalSample, ...]:
+) -> tuple[tuple[EvalObservationDecision, ...], int]:
     signal = CrossVenueSignal(
         pairs,
         CrossVenueSignalConfig(
@@ -226,59 +325,97 @@ def _recompute_signal_samples(
         ),
     )
     pairs_by_ticker = {pair.kalshi_ticker: pair for pair in pairs}
-    samples: list[EvalSignalSample] = []
+    decisions: list[EvalObservationDecision] = []
+    signal_count = 0
 
     def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        nonlocal signal_count
         for value in signal.compute(view):
             pair = pairs_by_ticker[value.kalshi_ticker]
-            samples.append(
-                EvalSignalSample(
+            signal_count += 1
+            decisions.append(
+                _observation_decision(
                     value=value,
                     pair=pair,
                     guard_reasons=_liquidity_guards(view, pair, config=config),
+                    outcomes=outcomes,
+                    config=config,
                 )
             )
         return ()
 
+    LOGGER.info("eval: replaying %s sorted raw book events", replay.row_count)
     BacktestEngine(
-        BacktestConfig(latency_ms=0, allow_zero_costs=True),
-    ).run(events, strategy)
-    return tuple(samples)
+        BacktestConfig(
+            latency_ms=0,
+            allow_zero_costs=True,
+            retain_event_history=False,
+        ),
+    ).run_sorted(
+        _iter_book_events(replay.frame),
+        strategy,
+        progress=_progress_logger(replay.row_count),
+        total_events=replay.row_count,
+    )
+    LOGGER.info(
+        "eval: replay complete; recomputed %s signal rows from %s events",
+        signal_count,
+        replay.row_count,
+    )
+    return tuple(decisions), signal_count
 
 
-def _decide_observations(
+def _observation_decision(
     *,
-    samples: Sequence[EvalSignalSample],
+    value: SignalValue,
+    pair: VerifiedContractPair,
+    guard_reasons: tuple[str, ...],
     outcomes: Mapping[tuple[str, str], int],
     config: EvalRunConfig,
-) -> tuple[EvalObservationDecision, ...]:
-    decisions: list[EvalObservationDecision] = []
-    for sample in samples:
-        value = sample.value
-        pair = sample.pair
-        realized = _realized_for_pair(pair, outcomes)
-        guard_reasons = list(sample.guard_reasons)
-        if realized is None:
-            guard_reasons.append("unresolved: no binary outcome in data/resolutions")
-        if value.confidence == Decimal("0") and "LOW CONFIDENCE:" in value.rationale:
-            guard_reasons.append(_extract_low_confidence_reason(value.rationale))
-        if _is_knockout_stage(pair, config.knockout_start_date) and not config.include_knockout:
-            guard_reasons.append("knockout_stage_unverified_resolution_criteria")
-        included = realized is not None and not guard_reasons
-        decisions.append(
-            EvalObservationDecision(
-                market_id=pair.polymarket_condition_id,
-                event_id=_event_id(pair),
-                ts_local_ns=value.ts_local_ns,
-                p_hat=value.fair_probability,
-                polymarket_mid=value.polymarket_probability,
-                kalshi_mid=value.kalshi_probability,
-                realized=realized,
-                included=included,
-                guard_reasons=tuple(guard_reasons),
-            )
+) -> EvalObservationDecision:
+    realized = _realized_for_pair(pair, outcomes)
+    effective_guard_reasons = list(guard_reasons)
+    if realized is None:
+        effective_guard_reasons.append("unresolved: no binary outcome in data/resolutions")
+    if value.confidence == Decimal("0") and "LOW CONFIDENCE:" in value.rationale:
+        effective_guard_reasons.append(_extract_low_confidence_reason(value.rationale))
+    if _is_knockout_stage(pair, config.knockout_start_date) and not config.include_knockout:
+        effective_guard_reasons.append("knockout_stage_unverified_resolution_criteria")
+    included = realized is not None and not effective_guard_reasons
+    return EvalObservationDecision(
+        market_id=pair.polymarket_condition_id,
+        event_id=_event_id(pair),
+        ts_local_ns=value.ts_local_ns,
+        p_hat=value.fair_probability,
+        polymarket_mid=value.polymarket_probability,
+        kalshi_mid=value.kalshi_probability,
+        realized=realized,
+        included=included,
+        guard_reasons=tuple(effective_guard_reasons),
+    )
+
+
+def _progress_logger(total_events: int) -> Callable[[int, int | None, int], None]:
+    next_percent = 10
+
+    def progress(processed: int, total: int | None, ts_local_ns: int) -> None:
+        nonlocal next_percent
+        if total is None or total <= 0:
+            return
+        percent = int(processed * 100 / total)
+        if percent < next_percent and processed < total:
+            return
+        LOGGER.info(
+            "eval: replay %s%% (%s/%s events, ts=%s)",
+            min(100, percent),
+            processed,
+            total,
+            ts_local_ns,
         )
-    return tuple(decisions)
+        while next_percent <= percent:
+            next_percent += 10
+
+    return progress
 
 
 def _load_resolution_outcomes(data_dir: Path) -> dict[tuple[str, str], int]:
@@ -392,8 +529,8 @@ def _manifest_payload(
     *,
     config: EvalRunConfig,
     pairs: tuple[VerifiedContractPair, ...],
-    events: tuple[BookEvent, ...],
-    samples: tuple[EvalSignalSample, ...],
+    replay: RawReplayData,
+    signal_count: int,
     decisions: tuple[EvalObservationDecision, ...],
     metrics: EvalMetrics,
 ) -> dict[str, object]:
@@ -417,8 +554,8 @@ def _manifest_payload(
         "config": config.jsonable(),
         "config_hash": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
         "data_time_range": {
-            "start_ns": min(event.ts_local_ns for event in events),
-            "end_ns": max(event.ts_local_ns for event in events),
+            "start_ns": replay.start_ns,
+            "end_ns": replay.end_ns,
         },
         "source": {
             "signals_from": "data/raw/book replay via CrossVenueSignal",
@@ -436,8 +573,9 @@ def _manifest_payload(
             ),
         },
         "n_pairs_loaded": len(pairs),
-        "n_raw_book_events": len(events),
-        "n_recomputed_signal_rows": len(samples),
+        "n_raw_book_events": replay.row_count,
+        "n_raw_book_files_scanned": replay.files_scanned,
+        "n_recomputed_signal_rows": signal_count,
         "n_observations": len(included),
         "distinct_event_count": metrics.scoring.distinct_event_count,
         "guards": _guard_summary(decisions),
@@ -593,6 +731,13 @@ def _optional_int(value: object) -> int | None:
     if isinstance(value, int):
         return value
     return int(str(value))
+
+
+def _required_int(value: object) -> int:
+    parsed = _optional_int(value)
+    if parsed is None:
+        raise ValueError("expected non-null integer")
+    return parsed
 
 
 def _decimal(value: object) -> Decimal:
