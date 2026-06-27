@@ -34,7 +34,7 @@ from pmbot.ingestion.kalshi import (
 from pmbot.runner.allowlist import load_verified_pairs
 from pmbot.runner.models import ResolutionRecord
 from pmbot.runner.orchestrator import CollectorOrchestrator
-from pmbot.runner.pairs import PairRegistry
+from pmbot.runner.pairs import CollectedPairStore, PairRegistry
 from pmbot.runner.resolutions import (
     GammaResolutionSource,
     KalshiResolutionSource,
@@ -66,6 +66,7 @@ async def run_collector(
 
     data_dir = Path(settings.DATA_DIR)
     state = CollectorStateStore(data_dir=data_dir, pairs_tracked=len(pairs))
+    pair_store = CollectedPairStore(data_dir=data_dir)
     resolution_store = ResolutionParquetStore(data_dir=data_dir)
 
     async with httpx.AsyncClient(timeout=20.0) as http:
@@ -90,6 +91,7 @@ async def run_collector(
             state=state,
         )
         registry = PairRegistry(live_pairs)
+        pair_store.save(registry.snapshot())
         state.set_pairs_tracked(len(registry.snapshot()))
 
         signal_writer = SignalParquetWriter(
@@ -117,6 +119,7 @@ async def run_collector(
             resolution_store=resolution_store,
             state=state,
             observer=observer,
+            pair_store=pair_store,
         )
         try:
             await refresher.refresh_once()

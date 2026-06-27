@@ -18,7 +18,7 @@ from typing import Protocol, cast
 import httpx
 
 from pmbot.runner.models import ResolutionRecord
-from pmbot.runner.pairs import PairRegistry, merge_tracked_pairs
+from pmbot.runner.pairs import CollectedPairStore, PairRegistry, merge_tracked_pairs
 from pmbot.runner.resolutions import ResolutionSource
 from pmbot.runner.signal_logging import SignalEventObserver
 from pmbot.runner.state import CollectorStateStore
@@ -138,6 +138,7 @@ class WorldCupAllowlistRefresher:
     resolution_store: ResolutionParquetStore
     state: CollectorStateStore | None = None
     observer: SignalEventObserver | None = None
+    pair_store: CollectedPairStore | None = None
 
     async def refresh_once(self) -> tuple[VerifiedContractPair, ...]:
         """Add newly discovered pairs and drop resolved markets."""
@@ -158,6 +159,8 @@ class WorldCupAllowlistRefresher:
             resolved_market_ids=resolved_market_ids,
         )
         self.registry.replace(next_pairs)
+        if self.pair_store is not None:
+            self.pair_store.save(next_pairs)
         if self.observer is not None:
             self.observer.set_pairs(next_pairs)
         if self.state is not None:

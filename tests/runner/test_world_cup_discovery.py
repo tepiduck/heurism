@@ -1,7 +1,7 @@
 import asyncio
 
 from pmbot.runner.models import ResolutionRecord
-from pmbot.runner.pairs import PairRegistry
+from pmbot.runner.pairs import CollectedPairStore, PairRegistry
 from pmbot.runner.resolutions import StaticResolutionSource
 from pmbot.runner.state import CollectorStateStore
 from pmbot.runner.streams import ResolutionParquetStore
@@ -93,6 +93,7 @@ def test_world_cup_refresh_adds_new_pairs_and_drops_resolved(tmp_path) -> None:
         keep_pair = _pair("0xkeep", "keep-yes", "keep-no", "KXWCGAME-26JUN26KEEP-KEEP")
         new_pair = _pair("0xnew", "new-yes", "new-no", "KXWCGAME-26JUN27NEW-NEW")
         registry = PairRegistry((old_pair, keep_pair))
+        pair_store = CollectedPairStore(data_dir=tmp_path)
         state = CollectorStateStore(data_dir=tmp_path, pairs_tracked=2)
         store = ResolutionParquetStore(data_dir=tmp_path)
         record = ResolutionRecord(
@@ -109,12 +110,14 @@ def test_world_cup_refresh_adds_new_pairs_and_drops_resolved(tmp_path) -> None:
             resolution_sources=(StaticResolutionSource((record,)),),
             resolution_store=store,
             state=state,
+            pair_store=pair_store,
         )
 
         refreshed = await refresher.refresh_once()
 
         assert refreshed == (keep_pair, new_pair)
         assert registry.snapshot() == (keep_pair, new_pair)
+        assert pair_store.load() == (keep_pair, new_pair)
         assert store.count == 1
         assert state.status.resolutions_collected == 1
         assert state.status.pairs_tracked == 2

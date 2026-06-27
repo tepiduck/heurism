@@ -267,6 +267,66 @@ def test_incoherent_three_way_probability_sum_marks_match_low_confidence_hold() 
     )
 
 
+def test_three_way_probability_sum_guard_skips_when_tie_leg_is_unavailable() -> None:
+    match_pairs = (
+        VerifiedContractPair(
+            polymarket_condition_id="pm-rsa",
+            polymarket_asset_id="pm-rsa-yes",
+            kalshi_ticker="KXWCGAME-26JUN27RSACAN-RSA",
+            rationale="fixture",
+        ),
+        VerifiedContractPair(
+            polymarket_condition_id="pm-can",
+            polymarket_asset_id="pm-can-yes",
+            kalshi_ticker="KXWCGAME-26JUN27RSACAN-CAN",
+            rationale="fixture",
+        ),
+    )
+    signal = CrossVenueSignal(
+        match_pairs,
+        CrossVenueSignalConfig(
+            kalshi_weight=Decimal("1"),
+            double_counting_overlap=Decimal("0"),
+            trade_threshold=Decimal("0.01"),
+            max_bid_ask_spread=Decimal("0.05"),
+            three_way_sum_tolerance=Decimal("0.05"),
+        ),
+    )
+    observed = []
+
+    def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        values = signal.compute(view)
+        if len(values) == 2:
+            observed.append(values)
+        return ()
+
+    BacktestEngine(zero_cost_backtest_config()).run(
+        [
+            *asset_snapshot(BASE_TS, "pm-rsa", "pm-rsa-yes", bid="0.34", ask="0.36"),
+            *asset_snapshot(BASE_TS, "pm-can", "pm-can-yes", bid="0.44", ask="0.46"),
+            *asset_snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN27RSACAN-RSA",
+                "KXWCGAME-26JUN27RSACAN-RSA",
+                bid="0.59",
+                ask="0.61",
+            ),
+            *asset_snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN27RSACAN-CAN",
+                "KXWCGAME-26JUN27RSACAN-CAN",
+                bid="0.59",
+                ask="0.61",
+            ),
+        ],
+        strategy,
+    )
+
+    latest = observed[-1]
+    assert all("three-way probability sum" not in value.rationale for value in latest)
+    assert all(value.confidence > Decimal("0") for value in latest)
+
+
 def test_cross_venue_signal_inverts_kalshi_probability_before_pooling() -> None:
     direct_signal = CrossVenueSignal(
         (PAIR,),

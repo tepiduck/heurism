@@ -6,9 +6,11 @@ import pytest
 
 from pmbot.eval.runner import EvalRunConfig, run_eval
 from pmbot.ingestion.recorder import ParquetRecorder
-from pmbot.ingestion.schemas import BookEvent, BookEventType, BookSide
+from pmbot.ingestion.schemas import BookEvent, BookEventType, BookSide, MetadataSnapshot
 from pmbot.runner.models import ResolutionRecord
+from pmbot.runner.pairs import CollectedPairStore
 from pmbot.runner.streams import ResolutionParquetStore
+from pmbot.signals.contracts import VerifiedContractPair
 
 BASE_TS = 1_800_000_000_000_000_000
 
@@ -156,6 +158,136 @@ def test_eval_runner_flags_guards_without_silently_dropping_context(tmp_path) ->
     ]
 
 
+def test_eval_runner_writes_diagnostics_when_no_observations_pass(tmp_path) -> None:
+    allowlist = tmp_path / "pairs.jsonl"
+    report = tmp_path / "diagnostic.json"
+    allowlist.write_text(
+        json.dumps(pair_row("pm-unresolved", "pm-unresolved-yes", "KXWCGAME-26JUN25MISS-MIS")),
+        encoding="utf-8",
+    )
+    write_books(
+        tmp_path,
+        [
+            *snapshot(BASE_TS, "pm-unresolved", "pm-unresolved-yes", bid="0.49", ask="0.51"),
+            *snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN25MISS-MIS",
+                "KXWCGAME-26JUN25MISS-MIS",
+                bid="0.59",
+                ask="0.61",
+            ),
+        ],
+    )
+
+    payload = run_eval(
+        EvalRunConfig(
+            data_dir=tmp_path,
+            report_path=report,
+            allowlist_path=allowlist,
+            bootstrap_samples=0,
+        )
+    )
+    saved = json.loads(report.read_text(encoding="utf-8"))
+
+    assert payload["diagnostic"] is True
+    assert saved["n_recomputed_signal_rows"] == 1
+    assert saved["n_observations"] == 0
+    assert saved["guards"]["reason_counts"] == {"unresolved": 1}
+    diagnostic = saved["pair_diagnostics"][0]
+    assert diagnostic["signal_samples"] == 1
+    assert diagnostic["resolution_found"] is False
+    assert diagnostic["resolution_keys_tried"] == [
+        {"venue": "polymarket", "market_id": "pm-unresolved"},
+        {"venue": "kalshi", "market_id": "KXWCGAME-26JUN25MISS-MIS"},
+    ]
+
+
+def test_eval_runner_scores_metadata_discovered_collected_pairs(tmp_path) -> None:
+    allowlist = tmp_path / "pairs.jsonl"
+    report = tmp_path / "metadata.json"
+    allowlist.write_text("", encoding="utf-8")
+    write_metadata(
+        tmp_path,
+        polymarket_metadata(
+            condition_id="pm-discovered",
+            yes_token="pm-discovered-yes",
+            no_token="pm-discovered-no",
+        ),
+        kalshi_metadata("KXWCGAME-26JUN25ABCDEF-ABC"),
+    )
+    write_books(
+        tmp_path,
+        [
+            *snapshot(BASE_TS, "pm-discovered", "pm-discovered-yes", bid="0.49", ask="0.51"),
+            *snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN25ABCDEF-ABC",
+                "KXWCGAME-26JUN25ABCDEF-ABC",
+                bid="0.59",
+                ask="0.61",
+            ),
+        ],
+    )
+    write_resolutions(tmp_path, ("kalshi", "KXWCGAME-26JUN25ABCDEF-ABC", "yes"))
+
+    payload = run_eval(
+        EvalRunConfig(
+            data_dir=tmp_path,
+            report_path=report,
+            allowlist_path=allowlist,
+            bootstrap_samples=0,
+        )
+    )
+
+    assert payload["n_observations"] == 1
+    assert payload["source"]["pair_source"]["static_pairs_loaded"] == 0
+    assert payload["source"]["pair_source"]["recorded_metadata_pairs_loaded"] == 1
+    assert payload["source"]["pair_source"]["collected_pairs_selected"] == 1
+
+
+def test_eval_runner_scores_collector_persisted_pairs(tmp_path) -> None:
+    allowlist = tmp_path / "pairs.jsonl"
+    report = tmp_path / "stored.json"
+    allowlist.write_text("", encoding="utf-8")
+    stored_pair = VerifiedContractPair(
+        polymarket_condition_id="pm-stored",
+        polymarket_asset_id="pm-stored-yes",
+        polymarket_no_asset_id="pm-stored-no",
+        kalshi_ticker="KXWCGAME-26JUN25STORED-STR",
+        rationale="collector discovered pair",
+    )
+    CollectedPairStore(data_dir=tmp_path).save((stored_pair,))
+    write_books(
+        tmp_path,
+        [
+            *snapshot(BASE_TS, "pm-stored", "pm-stored-yes", bid="0.49", ask="0.51"),
+            *snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN25STORED-STR",
+                "KXWCGAME-26JUN25STORED-STR",
+                bid="0.59",
+                ask="0.61",
+            ),
+        ],
+    )
+    write_resolutions(tmp_path, ("kalshi", "KXWCGAME-26JUN25STORED-STR", "yes"))
+
+    payload = run_eval(
+        EvalRunConfig(
+            data_dir=tmp_path,
+            report_path=report,
+            allowlist_path=allowlist,
+            bootstrap_samples=0,
+        )
+    )
+
+    assert payload["n_observations"] == 1
+    assert payload["source"]["pair_source"]["collector_pair_store_pairs_loaded"] == 1
+    assert payload["source"]["pair_source"]["selected_pair_sources"] == {
+        "collector_verified_pair_store": 1
+    }
+
+
 def write_books(tmp_path, events: list[BookEvent]) -> None:
     recorder = ParquetRecorder(
         data_dir=tmp_path,
@@ -164,6 +296,17 @@ def write_books(tmp_path, events: list[BookEvent]) -> None:
         partition_date=lambda: datetime.fromtimestamp(BASE_TS / 1_000_000_000, UTC).date(),
     )
     recorder.record_many(events)
+    recorder.flush_all()
+
+
+def write_metadata(tmp_path, *snapshots: MetadataSnapshot) -> None:
+    recorder = ParquetRecorder(
+        data_dir=tmp_path,
+        buffer_size=100,
+        flush_interval_seconds=999,
+        partition_date=lambda: datetime.fromtimestamp(BASE_TS / 1_000_000_000, UTC).date(),
+    )
+    recorder.record_many(snapshots)
     recorder.flush_all()
 
 
@@ -179,6 +322,62 @@ def write_resolutions(tmp_path, *rows: tuple[str, str, str]) -> None:
             raw_json=None,
         )
         for venue, market_id, outcome in rows
+    )
+
+
+def polymarket_metadata(
+    *,
+    condition_id: str,
+    yes_token: str,
+    no_token: str,
+) -> MetadataSnapshot:
+    raw = {
+        "conditionId": condition_id,
+        "question": "Will Alfa win on 2026-06-25?",
+        "outcomes": ["Yes", "No"],
+        "clobTokenIds": [yes_token, no_token],
+        "active": True,
+        "closed": False,
+        "acceptingOrders": True,
+        "slug": "fifwc-abc-def-2026-06-25-abc",
+        "__event_slug": "fifwc-abc-def-2026-06-25",
+        "__event_title": "Alfa vs Delta Winner?",
+    }
+    return MetadataSnapshot(
+        fetched_at="2026-06-25T12:00:00Z",
+        condition_id=condition_id,
+        question=str(raw["question"]),
+        outcomes=("Yes", "No"),
+        token_ids=(yes_token, no_token),
+        resolution_or_end_time=None,
+        active=True,
+        closed=False,
+        liquidity=None,
+        volume=None,
+        raw_json=json.dumps(raw),
+    )
+
+
+def kalshi_metadata(ticker: str) -> MetadataSnapshot:
+    raw = {
+        "ticker": ticker,
+        "title": "Alfa vs Delta Winner?",
+        "yes_sub_title": "Reg Time: Alfa",
+        "status": "open",
+        "expiration_time": "2026-06-25T23:00:00Z",
+    }
+    return MetadataSnapshot(
+        fetched_at="2026-06-25T12:00:00Z",
+        condition_id=ticker,
+        question=str(raw["title"]),
+        outcomes=("yes", "no"),
+        token_ids=(ticker,),
+        resolution_or_end_time=None,
+        active=True,
+        closed=False,
+        liquidity=None,
+        volume=None,
+        raw_json=json.dumps(raw),
     )
 
 

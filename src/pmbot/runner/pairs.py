@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
+from dataclasses import asdict
+from pathlib import Path
 
 from pmbot.signals.contracts import VerifiedContractPair
+
+COLLECTED_PAIRS_RELATIVE_PATH = Path("collector") / "verified_pairs.jsonl"
 
 
 class PairRegistry:
@@ -61,6 +67,59 @@ def merge_tracked_pairs(
 def pair_matches_market_ids(pair: VerifiedContractPair, market_ids: set[str]) -> bool:
     """Return whether a pair maps to any market identifier in ``market_ids``."""
     return pair.polymarket_condition_id in market_ids or pair.kalshi_ticker in market_ids
+
+
+class CollectedPairStore:
+    """Persist the collector's effective verified pair set for offline eval."""
+
+    def __init__(
+        self,
+        *,
+        data_dir: Path,
+        path: Path | None = None,
+    ) -> None:
+        self._path = path or data_dir / COLLECTED_PAIRS_RELATIVE_PATH
+
+    @property
+    def path(self) -> Path:
+        """Return the JSONL path used by this store."""
+        return self._path
+
+    def save(self, pairs: tuple[VerifiedContractPair, ...]) -> None:
+        """Atomically persist the current effective pair set."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._path.with_name(f"{self._path.name}.{time.time_ns()}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for pair in _dedupe_pairs(pairs):
+                handle.write(json.dumps(asdict(pair), sort_keys=True) + "\n")
+        tmp_path.replace(self._path)
+
+    def load(self) -> tuple[VerifiedContractPair, ...]:
+        """Load persisted pairs, returning an empty tuple when none exist."""
+        if not self._path.exists():
+            return ()
+        pairs: list[VerifiedContractPair] = []
+        for line in self._path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                continue
+            pairs.append(
+                VerifiedContractPair(
+                    polymarket_condition_id=str(payload["polymarket_condition_id"]),
+                    polymarket_asset_id=str(payload["polymarket_asset_id"]),
+                    kalshi_ticker=str(payload["kalshi_ticker"]),
+                    rationale=str(payload["rationale"]),
+                    invert_kalshi=bool(payload.get("invert_kalshi", False)),
+                    polymarket_no_asset_id=(
+                        str(payload["polymarket_no_asset_id"])
+                        if payload.get("polymarket_no_asset_id") is not None
+                        else None
+                    ),
+                )
+            )
+        return _dedupe_pairs(tuple(pairs))
 
 
 def _dedupe_pairs(pairs: tuple[VerifiedContractPair, ...]) -> tuple[VerifiedContractPair, ...]:
