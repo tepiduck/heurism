@@ -21,7 +21,7 @@ from enum import StrEnum
 
 from pmbot.backtest.engine import PointInTimeView
 from pmbot.backtest.models import BookSnapshot
-from pmbot.features.orderbook import midpoint
+from pmbot.features.orderbook import midpoint, spread
 from pmbot.ingestion.schemas import BookEvent, BookSide
 from pmbot.signals.contracts import VerifiedContractPair
 
@@ -184,6 +184,8 @@ class CrossVenueSignalConfig:
     kalshi_weight: Decimal = Decimal("1")
     double_counting_overlap: Decimal = Decimal("0.50")
     trade_threshold: Decimal = Decimal("0.01")
+    max_bid_ask_spread: Decimal | None = Decimal("0.10")
+    three_way_sum_tolerance: Decimal | None = Decimal("0.05")
     max_quote_age_ns: int = 2_000_000_000
     require_kalshi_leads: bool = True
     shrinkage_model: ShrinkageRegressionModel | None = None
@@ -239,8 +241,20 @@ class CrossVenueSignal:
     def compute(self, view: PointInTimeView) -> tuple[SignalValue, ...]:
         """Compute signals using only data exposed by the point-in-time view."""
         signals: list[SignalValue] = []
+        probability_sum_guards = _three_way_probability_sum_guards(
+            view,
+            self._pairs,
+            tolerance=self._config.three_way_sum_tolerance,
+        )
         for pair in self._pairs:
-            signal = self._compute_pair(view, pair)
+            group_key = _kalshi_match_group_key(pair.kalshi_ticker)
+            signal = self._compute_pair(
+                view,
+                pair,
+                probability_sum_guard=(
+                    probability_sum_guards.get(group_key) if group_key is not None else None
+                ),
+            )
             if signal is not None:
                 signals.append(signal)
         return tuple(signals)
@@ -249,6 +263,8 @@ class CrossVenueSignal:
         self,
         view: PointInTimeView,
         pair: VerifiedContractPair,
+        *,
+        probability_sum_guard: _LowConfidenceGuard | None,
     ) -> SignalValue | None:
         pm_yes_book = view.book(pair.polymarket_asset_id)
         kalshi_book = view.book(pair.kalshi_ticker)
@@ -304,6 +320,15 @@ class CrossVenueSignal:
             max(pm_quote_age_ns, kalshi_quote_age_ns),
             self._config.max_quote_age_ns,
         )
+        low_confidence_guard = _low_confidence_guard(
+            pm_yes_book=pm_yes_book,
+            kalshi_book=kalshi_book,
+            max_bid_ask_spread=self._config.max_bid_ask_spread,
+            probability_sum_guard=probability_sum_guard,
+        )
+        if low_confidence_guard is not None:
+            direction = SignalDirection.HOLD
+            confidence = ZERO
         return SignalValue(
             polymarket_condition_id=pair.polymarket_condition_id,
             polymarket_asset_id=pair.polymarket_asset_id,
@@ -320,6 +345,7 @@ class CrossVenueSignal:
                 config=self._config,
                 model_status=model_status,
                 invert_kalshi=pair.invert_kalshi,
+                low_confidence_guard=low_confidence_guard,
             ),
             resolution_probability=resolution_probability,
             convergence_logit_delta=convergence_delta,
@@ -487,6 +513,90 @@ class _QuoteClock:
         return min(self.bid_ns, self.ask_ns)
 
 
+@dataclass(frozen=True, slots=True)
+class _LowConfidenceGuard:
+    reason: str
+
+
+def _low_confidence_guard(
+    *,
+    pm_yes_book: BookSnapshot,
+    kalshi_book: BookSnapshot,
+    max_bid_ask_spread: Decimal | None,
+    probability_sum_guard: _LowConfidenceGuard | None,
+) -> _LowConfidenceGuard | None:
+    reasons: list[str] = []
+    if max_bid_ask_spread is not None:
+        for venue, book in (("Polymarket", pm_yes_book), ("Kalshi", kalshi_book)):
+            book_spread = spread(book)
+            if book_spread is not None and book_spread > max_bid_ask_spread:
+                reasons.append(
+                    f"{venue} spread {book_spread} exceeds {max_bid_ask_spread}"
+                )
+    if probability_sum_guard is not None:
+        reasons.append(probability_sum_guard.reason)
+    if not reasons:
+        return None
+    return _LowConfidenceGuard(reason="; ".join(reasons))
+
+
+def _three_way_probability_sum_guards(
+    view: PointInTimeView,
+    pairs: Sequence[VerifiedContractPair],
+    *,
+    tolerance: Decimal | None,
+) -> dict[str, _LowConfidenceGuard]:
+    if tolerance is None:
+        return {}
+    grouped: dict[str, list[VerifiedContractPair]] = {}
+    for pair in pairs:
+        group_key = _kalshi_match_group_key(pair.kalshi_ticker)
+        if group_key is None:
+            continue
+        grouped.setdefault(group_key, []).append(pair)
+
+    guards: dict[str, _LowConfidenceGuard] = {}
+    for group_key, group_pairs in grouped.items():
+        has_tie = any(_kalshi_leg(pair.kalshi_ticker) == "TIE" for pair in group_pairs)
+        if len(group_pairs) < 3 or not has_tie:
+            continue
+        pm_probabilities: list[Decimal] = []
+        kalshi_probabilities: list[Decimal] = []
+        for pair in group_pairs:
+            pm_mid = midpoint(view.book(pair.polymarket_asset_id))
+            kalshi_mid = midpoint(view.book(pair.kalshi_ticker))
+            if pm_mid is None or kalshi_mid is None:
+                break
+            if pair.invert_kalshi:
+                kalshi_mid = ONE - kalshi_mid
+            pm_probabilities.append(pm_mid)
+            kalshi_probabilities.append(kalshi_mid)
+        if len(pm_probabilities) != len(group_pairs):
+            continue
+
+        reasons: list[str] = []
+        pm_sum = sum(pm_probabilities, ZERO)
+        kalshi_sum = sum(kalshi_probabilities, ZERO)
+        if abs(pm_sum - ONE) > tolerance:
+            reasons.append(f"Polymarket three-way probability sum {pm_sum} outside 1+/-{tolerance}")
+        if abs(kalshi_sum - ONE) > tolerance:
+            reasons.append(f"Kalshi three-way probability sum {kalshi_sum} outside 1+/-{tolerance}")
+        if reasons:
+            guards[group_key] = _LowConfidenceGuard(reason="; ".join(reasons))
+    return guards
+
+
+def _kalshi_match_group_key(ticker: str) -> str | None:
+    group_key, separator, leg = ticker.upper().rpartition("-")
+    if not separator or not group_key or not leg:
+        return None
+    return group_key
+
+
+def _kalshi_leg(ticker: str) -> str:
+    return ticker.upper().rsplit("-", maxsplit=1)[-1]
+
+
 def _quote_clock(view: PointInTimeView, asset_id: str) -> _QuoteClock | None:
     bid_ns: int | None = None
     ask_ns: int | None = None
@@ -575,6 +685,7 @@ def _rationale(
     config: CrossVenueSignalConfig,
     model_status: str,
     invert_kalshi: bool,
+    low_confidence_guard: _LowConfidenceGuard | None,
 ) -> str:
     if model_status == "fitted_shrinkage_regression":
         detail = "fitted shrinkage regression on log-odds mids"
@@ -585,6 +696,8 @@ def _rationale(
         )
     if invert_kalshi:
         detail += "; Kalshi probability inverted"
+    if low_confidence_guard is not None:
+        detail += f"; LOW CONFIDENCE: {low_confidence_guard.reason}"
     return detail
 
 

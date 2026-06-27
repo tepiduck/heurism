@@ -154,6 +154,119 @@ def test_cross_venue_probabilities_use_midpoints_for_both_venues() -> None:
     assert observed[-1] == (Decimal("0.50"), Decimal("0.585"))
 
 
+def test_wide_bid_ask_spread_marks_signal_low_confidence_hold() -> None:
+    signal = CrossVenueSignal(
+        (PAIR,),
+        CrossVenueSignalConfig(
+            kalshi_weight=Decimal("1"),
+            double_counting_overlap=Decimal("0"),
+            trade_threshold=Decimal("0.01"),
+            max_bid_ask_spread=Decimal("0.05"),
+        ),
+    )
+    observed = []
+
+    def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        values = signal.compute(view)
+        if values:
+            observed.append(values[0])
+        return ()
+
+    BacktestEngine(zero_cost_backtest_config()).run(
+        [
+            book_event(BASE_TS, PM_CONDITION_ID, PM_ASSET_ID, BookSide.BID, "0.39", "10"),
+            book_event(BASE_TS, PM_CONDITION_ID, PM_ASSET_ID, BookSide.ASK, "0.51", "10"),
+            *kalshi_snapshot(BASE_TS + 1, bid="0.69", ask="0.71", size="10"),
+        ],
+        strategy,
+    )
+
+    value = observed[-1]
+    assert value.yes_edge is not None
+    assert value.yes_edge > Decimal("0.01")
+    assert value.direction == SignalDirection.HOLD
+    assert value.confidence == Decimal("0")
+    assert "Polymarket spread 0.12 exceeds 0.05" in value.rationale
+
+
+def test_incoherent_three_way_probability_sum_marks_match_low_confidence_hold() -> None:
+    match_pairs = (
+        VerifiedContractPair(
+            polymarket_condition_id="pm-rsa",
+            polymarket_asset_id="pm-rsa-yes",
+            kalshi_ticker="KXWCGAME-26JUN27RSACAN-RSA",
+            rationale="fixture",
+        ),
+        VerifiedContractPair(
+            polymarket_condition_id="pm-can",
+            polymarket_asset_id="pm-can-yes",
+            kalshi_ticker="KXWCGAME-26JUN27RSACAN-CAN",
+            rationale="fixture",
+        ),
+        VerifiedContractPair(
+            polymarket_condition_id="pm-tie",
+            polymarket_asset_id="pm-tie-yes",
+            kalshi_ticker="KXWCGAME-26JUN27RSACAN-TIE",
+            rationale="fixture",
+        ),
+    )
+    signal = CrossVenueSignal(
+        match_pairs,
+        CrossVenueSignalConfig(
+            kalshi_weight=Decimal("1"),
+            double_counting_overlap=Decimal("0"),
+            trade_threshold=Decimal("0.01"),
+            max_bid_ask_spread=Decimal("0.05"),
+            three_way_sum_tolerance=Decimal("0.05"),
+        ),
+    )
+    observed = []
+
+    def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        values = signal.compute(view)
+        if len(values) == 3:
+            observed.append(values)
+        return ()
+
+    BacktestEngine(zero_cost_backtest_config()).run(
+        [
+            *asset_snapshot(BASE_TS, "pm-rsa", "pm-rsa-yes", bid="0.34", ask="0.36"),
+            *asset_snapshot(BASE_TS, "pm-can", "pm-can-yes", bid="0.44", ask="0.46"),
+            *asset_snapshot(BASE_TS, "pm-tie", "pm-tie-yes", bid="0.19", ask="0.21"),
+            *asset_snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN27RSACAN-RSA",
+                "KXWCGAME-26JUN27RSACAN-RSA",
+                bid="0.59",
+                ask="0.61",
+            ),
+            *asset_snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN27RSACAN-CAN",
+                "KXWCGAME-26JUN27RSACAN-CAN",
+                bid="0.59",
+                ask="0.61",
+            ),
+            *asset_snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN27RSACAN-TIE",
+                "KXWCGAME-26JUN27RSACAN-TIE",
+                bid="0.10",
+                ask="0.12",
+            ),
+        ],
+        strategy,
+    )
+
+    latest = observed[-1]
+    assert {value.direction for value in latest} == {SignalDirection.HOLD}
+    assert {value.confidence for value in latest} == {Decimal("0")}
+    assert all(
+        "Kalshi three-way probability sum 1.31 outside 1+/-0.05" in value.rationale
+        for value in latest
+    )
+
+
 def test_cross_venue_signal_inverts_kalshi_probability_before_pooling() -> None:
     direct_signal = CrossVenueSignal(
         (PAIR,),
@@ -562,6 +675,37 @@ def kalshi_snapshot(
             BookSide.ASK,
             ask,
             str(Decimal(size) * Decimal(ask)),
+            exchange_ts=exchange_ts,
+        ),
+    )
+
+
+def asset_snapshot(
+    ts: int,
+    condition_id: str,
+    asset_id: str,
+    *,
+    bid: str,
+    ask: str,
+    exchange_ts: int | None = None,
+) -> tuple[BookEvent, BookEvent]:
+    return (
+        book_event(
+            ts,
+            condition_id,
+            asset_id,
+            BookSide.BID,
+            bid,
+            "10",
+            exchange_ts=exchange_ts,
+        ),
+        book_event(
+            ts,
+            condition_id,
+            asset_id,
+            BookSide.ASK,
+            ask,
+            "10",
             exchange_ts=exchange_ts,
         ),
     )
