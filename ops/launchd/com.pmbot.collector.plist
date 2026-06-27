@@ -39,6 +39,8 @@
     <string>__PROJECT_DIR__/data</string>
     <key>MODE</key>
     <string>paper</string>
+    <key>DISCOVERY_INTERVAL_SECONDS</key>
+    <string>1800</string>
     <key>SSL_CERT_FILE</key>
     <string>__PROJECT_DIR__/.venv/lib/python3.11/site-packages/certifi/cacert.pem</string>
   </dict>

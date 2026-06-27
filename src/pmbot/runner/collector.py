@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import httpx
 from websockets.asyncio.client import connect
@@ -32,6 +34,7 @@ from pmbot.ingestion.kalshi import (
 from pmbot.runner.allowlist import load_verified_pairs
 from pmbot.runner.models import ResolutionRecord
 from pmbot.runner.orchestrator import CollectorOrchestrator
+from pmbot.runner.pairs import PairRegistry
 from pmbot.runner.resolutions import (
     GammaResolutionSource,
     KalshiResolutionSource,
@@ -41,6 +44,10 @@ from pmbot.runner.resolutions import (
 from pmbot.runner.signal_logging import SignalEventObserver, SignalLoggingRecorder
 from pmbot.runner.state import CollectorStateStore
 from pmbot.runner.streams import ResolutionParquetStore, SignalParquetWriter
+from pmbot.runner.world_cup_discovery import (
+    WorldCupAllowlistRefresher,
+    WorldCupMatchWinnerDiscovery,
+)
 from pmbot.signals.contracts import VerifiedContractPair
 
 LOGGER = logging.getLogger(__name__)
@@ -52,11 +59,10 @@ async def run_collector(
     settings: Settings,
     duration_seconds: float | None = None,
     resolution_interval_seconds: float = 900.0,
+    discovery_interval_seconds: float = 1800.0,
 ) -> None:
     """Run the unattended read-only collector."""
     pairs = load_verified_pairs(allowlist_path)
-    if not pairs:
-        raise ValueError("allowlist contains no verified pairs")
 
     data_dir = Path(settings.DATA_DIR)
     state = CollectorStateStore(data_dir=data_dir, pairs_tracked=len(pairs))
@@ -83,6 +89,8 @@ async def run_collector(
             store=resolution_store,
             state=state,
         )
+        registry = PairRegistry(live_pairs)
+        state.set_pairs_tracked(len(registry.snapshot()))
 
         signal_writer = SignalParquetWriter(
             data_dir=data_dir,
@@ -96,41 +104,53 @@ async def run_collector(
             buffer_size=100,
             flush_interval_seconds=30.0,
         )
-        poller = (
-            ResolutionPoller(
-                pairs=live_pairs,
-                sources=resolution_sources,
-                store=resolution_store,
-                state=state,
+        discoverer = WorldCupMatchWinnerDiscovery(gamma=gamma, kalshi=kalshi_metadata)
+        refresher = WorldCupAllowlistRefresher(
+            registry=registry,
+            discoverer=discoverer,
+            resolution_sources=resolution_sources,
+            resolution_store=resolution_store,
+            state=state,
+            observer=observer,
+        )
+        try:
+            await refresher.refresh_once()
+        except Exception:
+            LOGGER.warning(
+                "startup World Cup discovery failed; continuing with loaded allowlist",
+                exc_info=True,
             )
-            if live_pairs
-            else None
+        poller = ResolutionPoller(
+            pairs=registry.snapshot,
+            sources=resolution_sources,
+            store=resolution_store,
+            state=state,
         )
         venue_tasks = (
-            (
-                PolymarketVenueTask(
-                    pairs=live_pairs,
-                    recorder=recorder,
-                    gamma=gamma,
-                    clob_http=ClobHttpClient(
-                        base_url=_url_or_default(
-                            settings.CLOB_HTTP_URL,
-                            DEFAULT_CLOB_HTTP_URL,
-                        ),
-                        http=http,
+            PolymarketVenueTask(
+                registry=registry,
+                recorder=recorder,
+                gamma=gamma,
+                clob_http=ClobHttpClient(
+                    base_url=_url_or_default(
+                        settings.CLOB_HTTP_URL,
+                        DEFAULT_CLOB_HTTP_URL,
                     ),
-                    ws_url=_url_or_default(settings.CLOB_WS_URL, DEFAULT_CLOB_WS_URL),
+                    http=http,
                 ),
-                KalshiVenueTask(
-                    pairs=live_pairs,
-                    recorder=recorder,
-                    metadata=kalshi_metadata,
-                    ws_url=KALSHI_WS_URL,
-                    auth=kalshi_auth,
-                ),
-            )
-            if live_pairs
-            else ()
+                ws_url=_url_or_default(settings.CLOB_WS_URL, DEFAULT_CLOB_WS_URL),
+            ),
+            KalshiVenueTask(
+                registry=registry,
+                recorder=recorder,
+                metadata=kalshi_metadata,
+                ws_url=KALSHI_WS_URL,
+                auth=kalshi_auth,
+            ),
+            WorldCupDiscoveryRefreshTask(
+                refresher=refresher,
+                interval_seconds=discovery_interval_seconds,
+            ),
         )
         orchestrator = CollectorOrchestrator(
             venue_tasks=venue_tasks,
@@ -184,14 +204,14 @@ class PolymarketVenueTask:
     def __init__(
         self,
         *,
-        pairs: tuple[VerifiedContractPair, ...],
+        registry: PairRegistry,
         recorder: SignalLoggingRecorder,
         gamma: GammaClient,
         clob_http: ClobHttpClient,
         ws_url: str,
         run_slice_seconds: int = 3_600,
     ) -> None:
-        self._pairs = pairs
+        self._registry = registry
         self._recorder = recorder
         self._gamma = gamma
         self._clob_http = clob_http
@@ -200,16 +220,24 @@ class PolymarketVenueTask:
 
     async def run(self) -> None:
         """Fetch metadata and run a bounded CLOB ingestion slice."""
+        pairs, version = self._registry.snapshot_with_version()
+        if not pairs:
+            await self._registry.wait_for_change(version)
+            return
         snapshots = await self._gamma.fetch_all_active_markets()
         self._recorder.record_many(snapshots)
         self._recorder.flush_all()
         ingestor = MarketDataIngestor(
-            token_ids=(pair.polymarket_asset_id for pair in self._pairs),
+            token_ids=(pair.polymarket_asset_id for pair in pairs),
             recorder=self._recorder,
             clob_http=self._clob_http,
             ws_url=self._ws_url,
         )
-        await ingestor.run(duration_seconds=self._run_slice_seconds)
+        await _run_until_registry_change(
+            registry=self._registry,
+            version=version,
+            task=asyncio.create_task(ingestor.run(duration_seconds=self._run_slice_seconds)),
+        )
 
 
 class KalshiVenueTask:
@@ -220,13 +248,13 @@ class KalshiVenueTask:
     def __init__(
         self,
         *,
-        pairs: tuple[VerifiedContractPair, ...],
+        registry: PairRegistry,
         recorder: SignalLoggingRecorder,
         metadata: KalshiMetadataClient,
         ws_url: str,
         auth: KalshiAuth | None = None,
     ) -> None:
-        self._pairs = pairs
+        self._registry = registry
         self._adapter = KalshiRecorderAdapter(recorder)
         self._metadata = metadata
         self._ws_url = ws_url
@@ -234,7 +262,11 @@ class KalshiVenueTask:
 
     async def run(self) -> None:
         """Fetch metadata and subscribe to Kalshi orderbook/trade channels."""
-        for pair in self._pairs:
+        pairs, version = self._registry.snapshot_with_version()
+        if not pairs:
+            await self._registry.wait_for_change(version)
+            return
+        for pair in pairs:
             self._adapter.record_market_metadata(
                 json.loads((await self._metadata.fetch_market(pair.kalshi_ticker)).raw_json)
             )
@@ -253,12 +285,71 @@ class KalshiVenueTask:
                 json.dumps(
                     kalshi_subscribe_message(
                         channels=("orderbook_delta", "trade"),
-                        market_tickers=tuple(pair.kalshi_ticker for pair in self._pairs),
+                        market_tickers=tuple(pair.kalshi_ticker for pair in pairs),
                     )
                 )
             )
-            async for message in websocket:
+            await self._record_until_registry_change(websocket, version=version)
+
+    async def _record_until_registry_change(self, websocket: Any, *, version: int) -> None:
+        change_task = asyncio.create_task(self._registry.wait_for_change(version))
+        recv_task = asyncio.create_task(websocket.recv())
+        try:
+            while True:
+                done, _pending = await asyncio.wait(
+                    {change_task, recv_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if change_task in done:
+                    return
+                message = recv_task.result()
                 self._adapter.record_frame(cast_ws_message(message))
+                recv_task = asyncio.create_task(websocket.recv())
+        finally:
+            change_task.cancel()
+            recv_task.cancel()
+            await asyncio.gather(change_task, recv_task, return_exceptions=True)
+
+
+class WorldCupDiscoveryRefreshTask:
+    """Supervised task that refreshes World Cup match-winner pairs."""
+
+    name = "world_cup_discovery"
+
+    def __init__(
+        self,
+        *,
+        refresher: WorldCupAllowlistRefresher,
+        interval_seconds: float,
+    ) -> None:
+        self._refresher = refresher
+        self._interval_seconds = interval_seconds
+
+    async def run(self) -> None:
+        """Refresh discovered World Cup pairs until cancelled."""
+        await self._refresher.run(interval_seconds=self._interval_seconds)
+
+
+async def _run_until_registry_change(
+    *,
+    registry: PairRegistry,
+    version: int,
+    task: asyncio.Task[None],
+) -> None:
+    change_task = asyncio.create_task(registry.wait_for_change(version))
+    try:
+        done, _pending = await asyncio.wait(
+            {task, change_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if change_task in done and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return
+        await task
+    finally:
+        change_task.cancel()
+        await asyncio.gather(change_task, return_exceptions=True)
 
 
 def _url_or_default(value: object, default: str) -> str:

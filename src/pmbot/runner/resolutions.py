@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Protocol
@@ -33,7 +33,7 @@ class ResolutionPoller:
     def __init__(
         self,
         *,
-        pairs: tuple[VerifiedContractPair, ...],
+        pairs: tuple[VerifiedContractPair, ...] | Callable[[], tuple[VerifiedContractPair, ...]],
         sources: tuple[ResolutionSource, ...],
         store: ResolutionParquetStore,
         state: CollectorStateStore | None = None,
@@ -46,8 +46,9 @@ class ResolutionPoller:
     async def poll_once(self) -> int:
         """Run one resolution poll and return newly written rows."""
         fetched: list[ResolutionRecord] = []
+        pairs = self._pairs() if callable(self._pairs) else self._pairs
         for source in self._sources:
-            fetched.extend(await source.fetch(self._pairs))
+            fetched.extend(await source.fetch(pairs))
         written = self._store.record_many(fetched)
         if self._state is not None:
             self._state.note_resolutions(written)

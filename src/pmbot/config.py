@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     KALSHI_PRIVATE_KEY_PATH: Path | None = Field(default=None, repr=False)
     MODE: Mode = Mode.PAPER
     DATA_DIR: Path = Path("data")
+    DISCOVERY_INTERVAL_SECONDS: float = 1800.0
     LIVE: str | None = Field(default=None, exclude=True, repr=False)
 
     @model_validator(mode="after")

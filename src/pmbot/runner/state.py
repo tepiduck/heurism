@@ -104,6 +104,19 @@ class CollectorStateStore:
         )
         self.save()
 
+    def set_pairs_tracked(self, count: int) -> None:
+        """Update the number of currently tracked pairs."""
+        if count == self._status.pairs_tracked:
+            return
+        self._status = CollectorStatus(
+            started_at_ns=self._status.started_at_ns,
+            updated_at_ns=time.time_ns(),
+            pairs_tracked=count,
+            resolutions_collected=self._status.resolutions_collected,
+            venues=self._status.venues,
+        )
+        self.save()
+
     def save(self) -> None:
         """Persist status atomically."""
         self._path.parent.mkdir(parents=True, exist_ok=True)

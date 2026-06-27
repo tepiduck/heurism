@@ -73,6 +73,12 @@ class SignalEventObserver:
         """Flush signal writer buffers."""
         self._signal_writer.flush_all()
 
+    def set_pairs(self, pairs: tuple[VerifiedContractPair, ...]) -> None:
+        """Replace the signal and venue-attribution pair set."""
+        self._pairs = pairs
+        self._signal = CrossVenueSignal(pairs)
+        self._venue_by_asset = _venue_map(pairs)
+
     def _apply_gap(self, event: GapEvent) -> None:
         venue = _venue_for_event(
             venue_by_identifier=self._venue_by_asset,

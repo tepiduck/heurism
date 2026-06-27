@@ -88,6 +88,7 @@ class KalshiMetadataClient:
         self,
         *,
         status: str | None = None,
+        series_ticker: str | None = None,
         limit: int = 100,
         cursor: str | None = None,
     ) -> tuple[list[Mapping[str, object]], str | None]:
@@ -95,6 +96,8 @@ class KalshiMetadataClient:
         params: dict[str, str | int] = {"limit": limit}
         if status is not None:
             params["status"] = status
+        if series_ticker is not None:
+            params["series_ticker"] = series_ticker
         if cursor is not None:
             params["cursor"] = cursor
 

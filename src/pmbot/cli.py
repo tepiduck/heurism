@@ -73,14 +73,28 @@ def run_collector_command(
             help="Seconds between resolution polls.",
         ),
     ] = 900.0,
+    discovery_interval: Annotated[
+        float | None,
+        typer.Option(
+            "--discovery-interval",
+            min=1,
+            help="Seconds between World Cup match-winner discovery refreshes.",
+        ),
+    ] = None,
 ) -> None:
     """Run the read-only Polymarket/Kalshi data collector."""
+    settings = Settings()
     asyncio.run(
         run_collector(
             allowlist_path=allowlist,
-            settings=Settings(),
+            settings=settings,
             duration_seconds=duration,
             resolution_interval_seconds=resolution_interval,
+            discovery_interval_seconds=(
+                settings.DISCOVERY_INTERVAL_SECONDS
+                if discovery_interval is None
+                else discovery_interval
+            ),
         )
     )
 

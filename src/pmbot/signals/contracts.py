@@ -71,6 +71,7 @@ class ContractMapper:
         polymarket: ContractMetadata,
         kalshi: ContractMetadata,
         polymarket_asset_id: str,
+        polymarket_no_asset_id: str | None = None,
     ) -> VerifiedContractPair | RejectedContractPair:
         """Verify a candidate pair or reject it with a rationale."""
         manual = self._allowlist.get((polymarket.identifier, kalshi.identifier))
@@ -129,6 +130,7 @@ class ContractMapper:
             polymarket_asset_id=polymarket_asset_id,
             kalshi_ticker=kalshi.identifier,
             rationale="exact title, rules, close time, outcome, and yes payout condition match",
+            polymarket_no_asset_id=polymarket_no_asset_id,
         )
 
 
