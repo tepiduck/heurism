@@ -119,6 +119,41 @@ def test_kalshi_probability_uses_midpoint_not_dollar_weighted_microprice() -> No
     assert observed[-1] == Decimal("0.585")
 
 
+def test_cross_venue_probabilities_use_midpoints_for_both_venues() -> None:
+    signal = CrossVenueSignal(
+        (PAIR,),
+        CrossVenueSignalConfig(
+            kalshi_weight=Decimal("1"),
+            double_counting_overlap=Decimal("0"),
+            trade_threshold=Decimal("0.01"),
+        ),
+    )
+    observed: list[tuple[Decimal, Decimal]] = []
+
+    def strategy(view: PointInTimeView) -> Iterable[OrderRequest]:
+        values = signal.compute(view)
+        if values:
+            observed.append(
+                (
+                    values[0].polymarket_probability,
+                    values[0].kalshi_probability,
+                )
+            )
+        return ()
+
+    BacktestEngine(zero_cost_backtest_config()).run(
+        [
+            book_event(BASE_TS, PM_CONDITION_ID, PM_ASSET_ID, BookSide.BID, "0.40", "10"),
+            book_event(BASE_TS, PM_CONDITION_ID, PM_ASSET_ID, BookSide.ASK, "0.60", "30"),
+            book_event(BASE_TS + 1, KALSHI_TICKER, KALSHI_TICKER, BookSide.BID, "0.58", "1"),
+            book_event(BASE_TS + 1, KALSHI_TICKER, KALSHI_TICKER, BookSide.ASK, "0.59", "100"),
+        ],
+        strategy,
+    )
+
+    assert observed[-1] == (Decimal("0.50"), Decimal("0.585"))
+
+
 def test_cross_venue_signal_inverts_kalshi_probability_before_pooling() -> None:
     direct_signal = CrossVenueSignal(
         (PAIR,),

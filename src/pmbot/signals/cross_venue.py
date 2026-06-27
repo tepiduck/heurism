@@ -2,7 +2,7 @@
 
 WP-3 v3 keeps three surfaces separate:
 
-* latent forecast mids/microprices for signal generation and Brier baselines;
+* latent forecast midpoints for signal generation and Brier baselines;
 * executable bid/ask prices for EV and trade gating;
 * resolution-target and convergence-target outputs for downstream evaluation.
 
@@ -21,7 +21,7 @@ from enum import StrEnum
 
 from pmbot.backtest.engine import PointInTimeView
 from pmbot.backtest.models import BookSnapshot
-from pmbot.features.orderbook import microprice, midpoint
+from pmbot.features.orderbook import midpoint
 from pmbot.ingestion.schemas import BookEvent, BookSide
 from pmbot.signals.contracts import VerifiedContractPair
 
@@ -252,7 +252,7 @@ class CrossVenueSignal:
     ) -> SignalValue | None:
         pm_yes_book = view.book(pair.polymarket_asset_id)
         kalshi_book = view.book(pair.kalshi_ticker)
-        pm_mid = microprice(pm_yes_book)
+        pm_mid = midpoint(pm_yes_book)
         kalshi_mid = midpoint(kalshi_book)
         if pm_mid is None or kalshi_mid is None:
             return None
