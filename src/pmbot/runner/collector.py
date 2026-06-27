@@ -97,7 +97,12 @@ async def run_collector(
             buffer_size=100,
             flush_interval_seconds=30.0,
         )
-        observer = SignalEventObserver(pairs=live_pairs, signal_writer=signal_writer, state=state)
+        observer = SignalEventObserver(
+            pairs=live_pairs,
+            signal_writer=signal_writer,
+            state=state,
+            signal_min_interval_ns=settings.SIGNAL_LOG_MIN_INTERVAL_MS * 1_000_000,
+        )
         recorder = SignalLoggingRecorder(
             data_dir=data_dir,
             observer=observer,

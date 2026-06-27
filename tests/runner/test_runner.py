@@ -122,6 +122,90 @@ def test_signal_logging_records_snapshot_batch_atomically(tmp_path) -> None:
     assert frame["kalshi_probability"].to_list() == [Decimal("0.6050000000")]
 
 
+def test_signal_logging_static_prices_write_one_signal_row(tmp_path) -> None:
+    writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=100, flush_interval_seconds=999)
+    observer = SignalEventObserver(
+        pairs=(PAIR,),
+        signal_writer=writer,
+        signal_min_interval_ns=250_000_000,
+    )
+    recorder = SignalLoggingRecorder(
+        data_dir=tmp_path,
+        observer=observer,
+        buffer_size=1_000,
+        flush_interval_seconds=999,
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.BID, "0.49", "10"),
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.ASK, "0.51", "10"),
+        )
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.BID, "0.69", "10"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
+        )
+    )
+
+    for index in range(20):
+        recorder.record_many(
+            (
+                book_event(BASE_TS + 2 + index, "KXTEST", "KXTEST", BookSide.BID, "0.69", "10"),
+                book_event(BASE_TS + 2 + index, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
+            )
+        )
+    recorder.flush_all()
+
+    files = list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
+    frame = pl.read_parquet(files)
+
+    assert len(frame) == 1
+    assert frame["kalshi_probability"].to_list() == [Decimal("0.7000000000")]
+
+
+def test_signal_logging_preserves_changed_signal_inside_throttle_window(tmp_path) -> None:
+    writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=100, flush_interval_seconds=999)
+    observer = SignalEventObserver(
+        pairs=(PAIR,),
+        signal_writer=writer,
+        signal_min_interval_ns=10_000_000_000,
+    )
+    recorder = SignalLoggingRecorder(
+        data_dir=tmp_path,
+        observer=observer,
+        buffer_size=1_000,
+        flush_interval_seconds=999,
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.BID, "0.49", "10"),
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.ASK, "0.51", "10"),
+        )
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.BID, "0.69", "10"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
+        )
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS + 2, "KXTEST", "KXTEST", BookSide.BID, "0.70", "10"),
+            book_event(BASE_TS + 2, "KXTEST", "KXTEST", BookSide.ASK, "0.72", "10"),
+        )
+    )
+    recorder.flush_all()
+
+    files = list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
+    frame = pl.read_parquet(files)
+
+    assert frame["kalshi_probability"].to_list() == [
+        Decimal("0.7000000000"),
+        Decimal("0.7100000000"),
+    ]
+
+
 def test_signal_logging_keeps_bounded_recent_history(tmp_path) -> None:
     writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=10_000, flush_interval_seconds=999)
     observer = SignalEventObserver(

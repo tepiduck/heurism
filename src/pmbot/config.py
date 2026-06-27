@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     MODE: Mode = Mode.PAPER
     DATA_DIR: Path = Path("data")
     DISCOVERY_INTERVAL_SECONDS: float = 1800.0
+    SIGNAL_LOG_MIN_INTERVAL_MS: int = 250
     LIVE: str | None = Field(default=None, exclude=True, repr=False)
 
     @model_validator(mode="after")
