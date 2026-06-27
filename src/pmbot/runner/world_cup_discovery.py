@@ -26,21 +26,31 @@ from pmbot.runner.streams import ResolutionParquetStore
 from pmbot.signals.contracts import ContractMapper, ContractMetadata, VerifiedContractPair
 
 WORLD_CUP_SERIES_TICKER = "KXWCGAME"
+POLYMARKET_WORLD_CUP_SERIES_SLUG = "soccer-fifwc"
 WORLD_CUP_DISCOVERY_RATIONALE = "world cup match-winner auto-discovery"
+POLYMARKET_FIXTURE_SLUG_RE = re.compile(
+    r"^fifwc-(?P<home>[a-z0-9]+)-(?P<away>[a-z0-9]+)-(?P<date>\d{4}-\d{2}-\d{2})$"
+)
+KALSHI_WC_TICKER_RE = re.compile(
+    rf"^{WORLD_CUP_SERIES_TICKER}-"
+    r"(?P<year>\d{2})(?P<month>[A-Z]{3})(?P<day>\d{2})"
+    r"(?P<matchup>[A-Z]+)-(?P<side>[A-Z]+|TIE)$"
+)
 
 
 class GammaMarketClient(Protocol):
     """Gamma subset needed by World Cup discovery."""
 
-    async def fetch_markets(
+    async def fetch_events(
         self,
         *,
+        series_slug: str | None = None,
         active: bool | None = None,
         closed: bool | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[Mapping[str, object]]:
-        """Fetch one Gamma market page."""
+        """Fetch one Gamma event page."""
 
 
 class KalshiSeriesClient(Protocol):
@@ -70,7 +80,7 @@ class WorldCupMatchWinnerDiscovery:
 
     gamma: GammaMarketClient
     kalshi: KalshiSeriesClient
-    page_size: int = 200
+    page_size: int = 20
 
     async def discover(self) -> tuple[VerifiedContractPair, ...]:
         """Fetch venue metadata and return verified unresolved pair matches."""
@@ -85,7 +95,8 @@ class WorldCupMatchWinnerDiscovery:
         offset = 0
         while True:
             try:
-                page = await self.gamma.fetch_markets(
+                events = await self.gamma.fetch_events(
+                    series_slug=POLYMARKET_WORLD_CUP_SERIES_SLUG,
                     active=True,
                     closed=False,
                     limit=self.page_size,
@@ -95,8 +106,8 @@ class WorldCupMatchWinnerDiscovery:
                 if offset > 0 and exc.response.status_code == 422:
                     break
                 raise
-            markets.extend(page)
-            if len(page) < self.page_size:
+            markets.extend(_polymarket_markets_from_events(events))
+            if len(events) < self.page_size:
                 break
             offset += self.page_size
         return tuple(markets)
@@ -242,20 +253,69 @@ class _MarketLeg:
     no_token_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _FixtureSlug:
+    home_code: str
+    away_code: str
+    day: date
+    slug: str
+
+
+def _polymarket_markets_from_events(
+    events: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...]:
+    markets: list[Mapping[str, object]] = []
+    for event in events:
+        event_slug = _optional_str(event.get("slug"))
+        if event_slug is None or _parse_polymarket_fixture_slug(event_slug) is None:
+            continue
+        if not _is_open_polymarket(event):
+            continue
+        raw_markets = event.get("markets")
+        if not isinstance(raw_markets, Sequence) or isinstance(
+            raw_markets,
+            (str, bytes, bytearray),
+        ):
+            continue
+        for raw_market in raw_markets:
+            if not isinstance(raw_market, Mapping):
+                continue
+            market = dict(raw_market)
+            market["__event_slug"] = event_slug
+            market["__event_title"] = _optional_str(event.get("title"))
+            market["__event_end_date"] = _optional_str(event.get("endDate"))
+            markets.append(market)
+    return tuple(markets)
+
+
 def _polymarket_leg(raw: Mapping[str, object]) -> _MarketLeg | None:
     if not _is_open_polymarket(raw) or not _has_world_cup_marker(raw):
         return None
-    question = _first_optional_str(raw, "question", "title")
-    if question is None:
+    event_slug = _polymarket_event_slug(raw)
+    if event_slug is None:
         return None
-    parsed = _parse_win_question(question)
-    if parsed is None:
+    fixture = _parse_polymarket_fixture_slug(event_slug)
+    if fixture is None:
         return None
-    team, opponent, date_text = parsed
-    day = _parse_date(date_text, default_year=_year_from_market(raw))
-    if day is None:
+    market_code = _polymarket_market_code(raw, fixture)
+    if market_code is None:
         return None
-    opponent = opponent or _opponent_from_matchup_texts(raw, team)
+    matchup_names = _matchup_names_from_text(
+        _first_optional_str(raw, "__event_title", "eventTitle")
+    )
+    code_to_name: dict[str, str] = {}
+    if matchup_names is not None:
+        code_to_name[fixture.home_code] = matchup_names[0]
+        code_to_name[fixture.away_code] = matchup_names[1]
+    team = code_to_name.get(market_code) or _first_optional_str(raw, "groupItemTitle")
+    if team is None:
+        question = _first_optional_str(raw, "question", "title")
+        parsed = _parse_win_question(question) if question is not None else None
+        team = parsed[0] if parsed is not None else None
+    if team is None:
+        return None
+    opponent_code = fixture.away_code if market_code == fixture.home_code else fixture.home_code
+    opponent = code_to_name.get(opponent_code) or _opponent_from_matchup_texts(raw, team)
     if opponent is None:
         return None
     yes_token_id, no_token_id = _polymarket_yes_no_token_ids(raw)
@@ -265,8 +325,8 @@ def _polymarket_leg(raw: Mapping[str, object]) -> _MarketLeg | None:
         identifier=_first_present_str(raw, "conditionId", "condition_id", "market"),
         team=_clean_team(team),
         opponent=_clean_team(opponent),
-        day=day,
-        match_key=_match_key(team, opponent, day),
+        day=fixture.day,
+        match_key=_match_key(team, opponent, fixture.day),
         yes_token_id=yes_token_id,
         no_token_id=no_token_id,
     )
@@ -274,25 +334,33 @@ def _polymarket_leg(raw: Mapping[str, object]) -> _MarketLeg | None:
 
 def _kalshi_leg(raw: Mapping[str, object]) -> _MarketLeg | None:
     ticker = _optional_str(raw.get("ticker"))
-    if ticker is None or not ticker.startswith(f"{WORLD_CUP_SERIES_TICKER}-"):
+    if ticker is None:
+        return None
+    ticker_match = KALSHI_WC_TICKER_RE.fullmatch(ticker)
+    if ticker_match is None or ticker_match.group("side") == "TIE":
         return None
     if not _is_open_kalshi(raw):
         return None
     question = _first_optional_str(raw, "title", "subtitle", "yes_sub_title")
     if question is None:
         return None
-    parsed = _parse_win_question(question)
-    if parsed is None:
+    matchup_names = _matchup_names_from_text(question)
+    if matchup_names is None:
         return None
-    team, opponent, date_text = parsed
-    day = (
-        _parse_date(date_text, default_year=_year_from_market(raw))
-        or _date_from_kalshi_ticker(ticker)
-        or _date_from_market(raw)
-    )
+    day = _date_from_kalshi_ticker(ticker) or _date_from_market(raw)
     if day is None:
         return None
-    opponent = opponent or _opponent_from_matchup_texts(raw, team)
+    team = _kalshi_side_team(raw)
+    if team is None or _team_key(team) == "tie":
+        return None
+    left, right = matchup_names
+    opponent: str | None
+    if _team_key(team) == _team_key(left):
+        opponent = right
+    elif _team_key(team) == _team_key(right):
+        opponent = left
+    else:
+        opponent = _opponent_from_matchup_texts(raw, team)
     if opponent is None:
         return None
     return _MarketLeg(
@@ -330,6 +398,81 @@ def _parse_win_question(question: str) -> tuple[str, str | None, str | None] | N
     return None
 
 
+def _matchup_names_from_text(value: str | None) -> tuple[str, str] | None:
+    if value is None:
+        return None
+    text = " ".join(value.strip().rstrip("?").split())
+    matchup = re.search(
+        r"(?P<left>[A-Za-z][A-Za-z .'-]+?)\s+"
+        r"(?:vs\.?|v\.?|versus|against)\s+"
+        r"(?P<right>[A-Za-z][A-Za-z .'-]+?)"
+        r"(?:\s+Winner|\s+-|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if matchup is None:
+        return None
+    return _clean_team(matchup.group("left")), _clean_team(matchup.group("right"))
+
+
+def _polymarket_event_slug(raw: Mapping[str, object]) -> str | None:
+    explicit = _first_optional_str(raw, "__event_slug", "eventSlug", "event_slug")
+    if explicit is not None:
+        return explicit
+    market_slug = _optional_str(raw.get("slug"))
+    if market_slug is None:
+        return None
+    match = re.fullmatch(
+        r"(?P<event>fifwc-[a-z0-9]+-[a-z0-9]+-\d{4}-\d{2}-\d{2})-[a-z0-9]+",
+        market_slug,
+    )
+    if match is None:
+        return None
+    return match.group("event")
+
+
+def _parse_polymarket_fixture_slug(value: str) -> _FixtureSlug | None:
+    match = POLYMARKET_FIXTURE_SLUG_RE.fullmatch(value)
+    if match is None:
+        return None
+    return _FixtureSlug(
+        home_code=match.group("home"),
+        away_code=match.group("away"),
+        day=date.fromisoformat(match.group("date")),
+        slug=value,
+    )
+
+
+def _polymarket_market_code(raw: Mapping[str, object], fixture: _FixtureSlug) -> str | None:
+    market_slug = _optional_str(raw.get("slug"))
+    if market_slug is None:
+        return None
+    prefix = fixture.slug + "-"
+    if not market_slug.startswith(prefix):
+        return None
+    suffix = market_slug.removeprefix(prefix)
+    if suffix == "draw":
+        return None
+    if suffix not in {fixture.home_code, fixture.away_code}:
+        return None
+    question = _optional_str(raw.get("question")) or ""
+    if " draw" in question.casefold() or "end in a draw" in question.casefold():
+        return None
+    return suffix
+
+
+def _kalshi_side_team(raw: Mapping[str, object]) -> str | None:
+    side_text = _first_optional_str(raw, "yes_sub_title", "subtitle")
+    if side_text is not None:
+        text = side_text.strip()
+        if ":" in text:
+            text = text.rsplit(":", 1)[1]
+        text = _clean_team(text)
+        if text:
+            return text
+    return None
+
+
 def _polymarket_yes_no_token_ids(raw: Mapping[str, object]) -> tuple[str | None, str | None]:
     outcomes = _json_string_list(raw.get("outcomes"))
     token_ids = _json_string_list(raw.get("clobTokenIds"))
@@ -355,6 +498,8 @@ def _is_open_polymarket(raw: Mapping[str, object]) -> bool:
     if _optional_bool(raw.get("closed")) is True:
         return False
     if _optional_bool(raw.get("active")) is False:
+        return False
+    if _optional_bool(raw.get("acceptingOrders")) is False:
         return False
     return not _has_resolution_value(raw)
 
@@ -391,7 +536,7 @@ def _has_world_cup_marker(raw: Mapping[str, object]) -> bool:
     return any(
         marker in text.casefold()
         for text in _all_text_values(raw)
-        for marker in ("world cup", "fifa", "kxwcgame")
+        for marker in ("world cup", "fifa", "fifwc", "kxwcgame")
     )
 
 
@@ -440,10 +585,7 @@ def _canonical_yes_payout(team: str, opponent: str, day: date) -> str:
 
 
 def _date_from_kalshi_ticker(ticker: str) -> date | None:
-    match = re.search(
-        rf"{WORLD_CUP_SERIES_TICKER}-(?P<year>\d{{2}})(?P<month>[A-Z]{{3}})(?P<day>\d{{1,2}})",
-        ticker,
-    )
+    match = KALSHI_WC_TICKER_RE.fullmatch(ticker)
     if match is None:
         return None
     month = _MONTHS.get(match.group("month").casefold())
@@ -511,6 +653,8 @@ def _all_text_values(raw: Mapping[str, object]) -> tuple[str, ...]:
         "eventSlug",
         "series_ticker",
         "ticker",
+        "__event_slug",
+        "__event_title",
     ):
         value = raw.get(key)
         if isinstance(value, str):
@@ -572,7 +716,23 @@ def _clean_team(value: str) -> str:
 
 
 def _team_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", _clean_team(value).casefold())
+    key = re.sub(r"[^a-z0-9]+", "", _clean_team(value).casefold())
+    return _TEAM_ALIASES.get(key, key)
+
+
+_TEAM_ALIASES = {
+    "bosniaherzegovina": "bosniaandherzegovina",
+    "bosniaandherzegovina": "bosniaandherzegovina",
+    "cotedivoire": "ivorycoast",
+    "congodr": "congodr",
+    "drcongo": "congodr",
+    "democraticrepublicofthecongo": "congodr",
+    "netherlands": "netherlands",
+    "nederland": "netherlands",
+    "unitedstates": "unitedstates",
+    "usa": "unitedstates",
+    "us": "unitedstates",
+}
 
 
 _MONTHS = cast(

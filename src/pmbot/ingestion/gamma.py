@@ -51,6 +51,32 @@ class GammaClient:
             raise TypeError("Gamma /markets response must be a list")
         return [cast(Mapping[str, object], item) for item in payload if isinstance(item, Mapping)]
 
+    async def fetch_events(
+        self,
+        *,
+        series_slug: str | None = None,
+        active: bool | None = None,
+        closed: bool | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Mapping[str, object]]:
+        """Fetch one page of Gamma events."""
+        params: dict[str, str | int | bool] = {"limit": limit, "offset": offset}
+        if series_slug is not None:
+            params["series_slug"] = series_slug
+        if active is not None:
+            params["active"] = active
+        if closed is not None:
+            params["closed"] = closed
+
+        async with self._client() as client:
+            response = await client.get(f"{self._base_url}/events", params=params)
+            response.raise_for_status()
+            payload = json.loads(response.text, parse_float=Decimal)
+        if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes, bytearray)):
+            raise TypeError("Gamma /events response must be a list")
+        return [cast(Mapping[str, object], item) for item in payload if isinstance(item, Mapping)]
+
     async def fetch_all_active_markets(self, *, page_size: int = 100) -> list[MetadataSnapshot]:
         """Fetch all active, open Gamma markets with order-book metadata."""
         snapshots: list[MetadataSnapshot] = []

@@ -22,12 +22,12 @@ def test_world_cup_discovery_matches_fixture_markets_with_no_token() -> None:
 
     assert pairs == (
         VerifiedContractPair(
-            polymarket_condition_id="0xwc-colombia-uzbekistan",
+            polymarket_condition_id="0xwc-panama-england",
             polymarket_asset_id="1111111111111111111111111111111111111111",
             polymarket_no_asset_id="2222222222222222222222222222222222222222",
-            kalshi_ticker="KXWCGAME-26JUN27COLUZB-COL",
+            kalshi_ticker="KXWCGAME-26JUN27PANENG-ENG",
             rationale=(
-                "world cup match-winner auto-discovery: Colombia vs Uzbekistan on 2026-06-27; "
+                "world cup match-winner auto-discovery: England vs Panama on 2026-06-27; "
                 "exact title, rules, close time, outcome, and yes payout condition match"
             ),
             invert_kalshi=False,
@@ -38,7 +38,7 @@ def test_world_cup_discovery_matches_fixture_markets_with_no_token() -> None:
 def test_world_cup_discoverer_queries_gamma_and_kxwcgame_series() -> None:
     async def run() -> None:
         discovery = WorldCupMatchWinnerDiscovery(
-            gamma=FakeGammaClient([_polymarket_fixture()]),
+            gamma=FakeGammaClient([_polymarket_event_fixture()]),
             kalshi=FakeKalshiClient([_kalshi_fixture()]),
         )
 
@@ -61,6 +61,30 @@ def test_world_cup_discovery_excludes_resolved_markets() -> None:
         [_polymarket_fixture()],
         [settled_kalshi],
     ) == ()
+
+
+def test_world_cup_discovery_matches_real_congo_name_and_code_aliases() -> None:
+    polymarket = {
+        **_polymarket_fixture(),
+        "conditionId": "0xwc-congo-uzbekistan",
+        "question": "Will DR Congo win on 2026-06-27?",
+        "__event_slug": "fifwc-cdr-uzb-2026-06-27",
+        "__event_title": "DR Congo vs. Uzbekistan",
+        "slug": "fifwc-cdr-uzb-2026-06-27-cdr",
+        "groupItemTitle": "DR Congo",
+    }
+    kalshi = {
+        **_kalshi_fixture(),
+        "ticker": "KXWCGAME-26JUN27CODUZB-COD",
+        "title": "Congo DR vs Uzbekistan Winner?",
+        "yes_sub_title": "Congo DR",
+    }
+
+    pairs = match_world_cup_match_winner_markets([polymarket], [kalshi])
+
+    assert len(pairs) == 1
+    assert pairs[0].polymarket_condition_id == "0xwc-congo-uzbekistan"
+    assert pairs[0].kalshi_ticker == "KXWCGAME-26JUN27CODUZB-COD"
 
 
 def test_world_cup_refresh_adds_new_pairs_and_drops_resolved(tmp_path) -> None:
@@ -99,18 +123,29 @@ def test_world_cup_refresh_adds_new_pairs_and_drops_resolved(tmp_path) -> None:
 
 
 def test_world_cup_discovery_never_adds_non_world_cup_market() -> None:
-    non_wc_polymarket = {
+    tournament_outright = {
         **_polymarket_fixture(),
-        "eventTitle": "International friendly: Colombia vs Uzbekistan",
-        "slug": "colombia-uzbekistan-friendly",
+        "__event_slug": "world-cup-winner",
+        "__event_title": "World Cup Winner",
+        "slug": "world-cup-winner-england",
+    }
+    group_winner = {
+        **_polymarket_fixture(),
+        "__event_slug": "fifwc-group-a-winner",
+        "__event_title": "FIFA World Cup Group A Winner",
+        "slug": "fifwc-group-a-winner-england",
     }
     non_wc_kalshi = {
         **_kalshi_fixture(),
-        "ticker": "KXFRIENDLY-26JUN27COLUZB-COL",
+        "ticker": "KXFRIENDLY-26JUN27PANENG-ENG",
     }
 
     assert match_world_cup_match_winner_markets(
-        [non_wc_polymarket],
+        [tournament_outright],
+        [_kalshi_fixture()],
+    ) == ()
+    assert match_world_cup_match_winner_markets(
+        [group_winner],
         [_kalshi_fixture()],
     ) == ()
     assert match_world_cup_match_winner_markets(
@@ -128,21 +163,23 @@ class StaticDiscoverer:
 
 
 class FakeGammaClient:
-    def __init__(self, markets: list[dict[str, object]]) -> None:
-        self._markets = markets
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        self._events = events
 
-    async def fetch_markets(
+    async def fetch_events(
         self,
         *,
+        series_slug: str | None = None,
         active: bool | None = None,
         closed: bool | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, object]]:
+        assert series_slug == "soccer-fifwc"
         assert active is True
         assert closed is False
-        assert limit == 200
-        return self._markets[offset : offset + limit]
+        assert limit == 20
+        return self._events[offset : offset + limit]
 
 
 class FakeKalshiClient:
@@ -160,7 +197,7 @@ class FakeKalshiClient:
         del cursor
         assert status == "open"
         assert series_ticker == WORLD_CUP_SERIES_TICKER
-        assert limit == 200
+        assert limit == 20
         return self._markets, None
 
 
@@ -181,10 +218,12 @@ def _pair(
 
 def _polymarket_fixture() -> dict[str, object]:
     return {
-        "conditionId": "0xwc-colombia-uzbekistan",
-        "question": "Will Colombia win on June 27, 2026?",
-        "eventTitle": "2026 FIFA World Cup: Colombia vs Uzbekistan",
-        "slug": "2026-fifa-world-cup-colombia-vs-uzbekistan",
+        "conditionId": "0xwc-panama-england",
+        "question": "Will England win on 2026-06-27?",
+        "__event_slug": "fifwc-pan-eng-2026-06-27",
+        "__event_title": "Panama vs. England",
+        "slug": "fifwc-pan-eng-2026-06-27-eng",
+        "groupItemTitle": "England",
         "outcomes": '["Yes","No"]',
         "clobTokenIds": (
             '["1111111111111111111111111111111111111111",'
@@ -196,11 +235,21 @@ def _polymarket_fixture() -> dict[str, object]:
     }
 
 
+def _polymarket_event_fixture() -> dict[str, object]:
+    return {
+        "slug": "fifwc-pan-eng-2026-06-27",
+        "title": "Panama vs. England",
+        "active": True,
+        "closed": False,
+        "markets": [_polymarket_fixture()],
+    }
+
+
 def _kalshi_fixture() -> dict[str, object]:
     return {
-        "ticker": "KXWCGAME-26JUN27COLUZB-COL",
-        "title": "Will Colombia win against Uzbekistan on June 27, 2026?",
-        "event_title": "2026 FIFA World Cup: Colombia vs Uzbekistan",
-        "status": "open",
+        "ticker": "KXWCGAME-26JUN27PANENG-ENG",
+        "title": "Panama vs England Winner?",
+        "yes_sub_title": "England",
+        "status": "active",
         "close_time": "2026-06-27T22:00:00Z",
     }
