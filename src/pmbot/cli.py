@@ -13,6 +13,7 @@ from rich.console import Console
 
 from pmbot.config import Settings
 from pmbot.eval.runner import EvalRunConfig, run_eval
+from pmbot.ingestion.compaction import compact_raw_data
 from pmbot.ingestion.runner import run_ingestion
 from pmbot.runner import (
     HARVEST_STATUS_RELATIVE_PATH,
@@ -251,6 +252,30 @@ def harvest_status_command(
             ),
             tracked_label="markets tracked",
         )
+    )
+
+
+@app.command("compact")
+def compact_command(
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            file_okay=False,
+            help="Data directory to compact; defaults to Settings.DATA_DIR.",
+        ),
+    ] = None,
+) -> None:
+    """Compact closed raw-data Parquet partitions."""
+    settings = Settings()
+    summary = compact_raw_data(Path(data_dir or settings.DATA_DIR))
+    console.print(
+        "Compaction complete | "
+        f"seen={summary.partitions_seen} | "
+        f"compacted={summary.partitions_compacted} | "
+        f"active_skipped={summary.partitions_skipped_active} | "
+        f"files_removed={summary.files_removed} | "
+        f"rows={summary.rows_written}"
     )
 
 

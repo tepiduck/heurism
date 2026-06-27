@@ -20,7 +20,12 @@ from pmbot.ingestion.recorder import ParquetRecorder
 async def run_ingestion(*, markets: str, duration_seconds: int, settings: Settings) -> None:
     """Run read-only public market-data ingestion from CLI arguments."""
     data_dir = Path(settings.DATA_DIR)
-    recorder = ParquetRecorder(data_dir=data_dir)
+    recorder = ParquetRecorder(
+        data_dir=data_dir,
+        buffer_size=settings.RAW_RECORDER_BUFFER_SIZE,
+        flush_interval_seconds=settings.RECORDER_FLUSH_INTERVAL_SECONDS,
+        max_recorded_depth=settings.MAX_RECORDED_DEPTH,
+    )
     gamma_url = _url_or_default(settings.GAMMA_URL, DEFAULT_GAMMA_URL)
     clob_http_url = _url_or_default(settings.CLOB_HTTP_URL, DEFAULT_CLOB_HTTP_URL)
     clob_ws_url = _url_or_default(settings.CLOB_WS_URL, DEFAULT_CLOB_WS_URL)

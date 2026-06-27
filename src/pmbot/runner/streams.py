@@ -60,8 +60,8 @@ class SignalParquetWriter:
         self,
         *,
         data_dir: Path,
-        buffer_size: int = 100,
-        flush_interval_seconds: float = 30.0,
+        buffer_size: int = 10_000,
+        flush_interval_seconds: float = 60.0,
         partition_date: Callable[[], date] | None = None,
     ) -> None:
         self._root = data_dir

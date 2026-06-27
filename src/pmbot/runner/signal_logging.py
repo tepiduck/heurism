@@ -18,6 +18,7 @@ from pmbot.signals.contracts import VerifiedContractPair
 from pmbot.signals.cross_venue import CrossVenueSignal, SignalValue
 
 DEFAULT_SIGNAL_MIN_INTERVAL_NS = 250_000_000
+DEFAULT_RAW_RECORDER_BUFFER_SIZE = 10_000
 _PairKey = tuple[str, str, str]
 _BookFingerprint = tuple[tuple[str, Decimal, Decimal], ...]
 _SignalFingerprint = tuple[
@@ -198,13 +199,15 @@ class SignalLoggingRecorder(ParquetRecorder):
         *,
         data_dir: Path,
         observer: SignalEventObserver,
-        buffer_size: int = 100,
-        flush_interval_seconds: float = 30.0,
+        buffer_size: int = DEFAULT_RAW_RECORDER_BUFFER_SIZE,
+        flush_interval_seconds: float = 60.0,
+        max_recorded_depth: int | None = 10,
     ) -> None:
         super().__init__(
             data_dir=data_dir,
             buffer_size=buffer_size,
             flush_interval_seconds=flush_interval_seconds,
+            max_recorded_depth=max_recorded_depth,
         )
         self._observer = observer
 
@@ -216,8 +219,7 @@ class SignalLoggingRecorder(ParquetRecorder):
     def record_many(self, events: Iterable[NormalizedEvent]) -> None:
         """Record and observe many normalized events as one atomic frame."""
         event_tuple = tuple(events)
-        for event in event_tuple:
-            ParquetRecorder.record(self, event)
+        ParquetRecorder.record_many(self, event_tuple)
         self._observer.observe_many(event_tuple)
 
     def flush_all(self) -> None:

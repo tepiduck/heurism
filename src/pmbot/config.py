@@ -38,7 +38,12 @@ class Settings(BaseSettings):
     MODE: Mode = Mode.PAPER
     DATA_DIR: Path = Path("data")
     DISCOVERY_INTERVAL_SECONDS: float = 1800.0
+    COMPACTION_INTERVAL_SECONDS: float = 3600.0
     SIGNAL_LOG_MIN_INTERVAL_MS: int = 250
+    MAX_RECORDED_DEPTH: int = 10
+    RAW_RECORDER_BUFFER_SIZE: int = 10_000
+    SIGNAL_RECORDER_BUFFER_SIZE: int = 10_000
+    RECORDER_FLUSH_INTERVAL_SECONDS: float = 60.0
     LIVE: str | None = Field(default=None, exclude=True, repr=False)
 
     @model_validator(mode="after")

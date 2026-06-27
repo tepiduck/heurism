@@ -32,6 +32,7 @@ from pmbot.ingestion.kalshi import (
     kalshi_websocket_headers,
 )
 from pmbot.runner.allowlist import load_verified_pairs
+from pmbot.runner.compaction import RawDataCompactionTask
 from pmbot.runner.models import ResolutionRecord
 from pmbot.runner.orchestrator import CollectorOrchestrator
 from pmbot.runner.pairs import CollectedPairStore, PairRegistry
@@ -97,8 +98,8 @@ async def run_collector(
 
         signal_writer = SignalParquetWriter(
             data_dir=data_dir,
-            buffer_size=100,
-            flush_interval_seconds=30.0,
+            buffer_size=settings.SIGNAL_RECORDER_BUFFER_SIZE,
+            flush_interval_seconds=settings.RECORDER_FLUSH_INTERVAL_SECONDS,
         )
         observer = SignalEventObserver(
             pairs=live_pairs,
@@ -109,8 +110,9 @@ async def run_collector(
         recorder = SignalLoggingRecorder(
             data_dir=data_dir,
             observer=observer,
-            buffer_size=100,
-            flush_interval_seconds=30.0,
+            buffer_size=settings.RAW_RECORDER_BUFFER_SIZE,
+            flush_interval_seconds=settings.RECORDER_FLUSH_INTERVAL_SECONDS,
+            max_recorded_depth=settings.MAX_RECORDED_DEPTH,
         )
         discoverer = WorldCupMatchWinnerDiscovery(gamma=gamma, kalshi=kalshi_metadata)
         refresher = WorldCupAllowlistRefresher(
@@ -159,6 +161,10 @@ async def run_collector(
             WorldCupDiscoveryRefreshTask(
                 refresher=refresher,
                 interval_seconds=discovery_interval_seconds,
+            ),
+            RawDataCompactionTask(
+                data_dir=data_dir,
+                interval_seconds=settings.COMPACTION_INTERVAL_SECONDS,
             ),
         )
         orchestrator = CollectorOrchestrator(

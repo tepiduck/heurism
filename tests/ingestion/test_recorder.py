@@ -43,3 +43,83 @@ def test_recorder_round_trip_preserves_decimal_schema_and_values(tmp_path) -> No
     assert frame["ts_monotonic_ns"][0] == 456
     assert frame["price"][0] == Decimal("0.456")
     assert frame["size"][0] == Decimal("219.217767")
+
+
+def test_recorder_caps_book_depth_and_emits_boundary_deltas(tmp_path) -> None:
+    recorder = ParquetRecorder(
+        data_dir=tmp_path,
+        buffer_size=100,
+        flush_interval_seconds=999,
+        partition_date=lambda: date(2026, 6, 24),
+        max_recorded_depth=2,
+    )
+    recorder.record_many(
+        [
+            book_event("asset-yes", BookSide.BID, "0.50", "10", seq="snapshot"),
+            book_event("asset-yes", BookSide.BID, "0.49", "20", seq="snapshot"),
+            book_event("asset-yes", BookSide.BID, "0.48", "30", seq="snapshot"),
+            book_event("asset-yes", BookSide.ASK, "0.51", "10", seq="snapshot"),
+            book_event("asset-yes", BookSide.ASK, "0.52", "20", seq="snapshot"),
+            book_event("asset-yes", BookSide.ASK, "0.53", "30", seq="snapshot"),
+        ]
+    )
+    recorder.record(
+        book_event(
+            "asset-yes",
+            BookSide.BID,
+            "0.50",
+            "0",
+            event_type=BookEventType.DELTA,
+            seq="delta-1",
+        )
+    )
+    recorder.record(
+        book_event(
+            "asset-yes",
+            BookSide.BID,
+            "0.47",
+            "100",
+            event_type=BookEventType.DELTA,
+            seq="delta-2",
+        )
+    )
+    recorder.flush_all()
+
+    files = list(
+        (tmp_path / "raw" / "book" / "date=2026-06-24" / "market=condition-1").glob(
+            "*.parquet"
+        )
+    )
+    frame = pl.read_parquet(files).sort(["ts_local_ns", "side", "price"])
+
+    assert frame.select("event_type", "side", "price", "size", "seq_or_hash").rows() == [
+        ("snapshot", "ask", Decimal("0.5100000000"), Decimal("10.0000000000"), "snapshot"),
+        ("snapshot", "ask", Decimal("0.5200000000"), Decimal("20.0000000000"), "snapshot"),
+        ("snapshot", "bid", Decimal("0.4900000000"), Decimal("20.0000000000"), "snapshot"),
+        ("snapshot", "bid", Decimal("0.5000000000"), Decimal("10.0000000000"), "snapshot"),
+        ("delta", "bid", Decimal("0.4800000000"), Decimal("30.0000000000"), "delta-1"),
+        ("delta", "bid", Decimal("0.5000000000"), Decimal("0E-10"), "delta-1"),
+    ]
+
+
+def book_event(
+    asset_id: str,
+    side: BookSide,
+    price: str,
+    size: str,
+    *,
+    event_type: BookEventType = BookEventType.SNAPSHOT,
+    seq: str,
+) -> BookEvent:
+    return BookEvent(
+        ts_local_ns=123 if event_type == BookEventType.SNAPSHOT else 124,
+        ts_monotonic_ns=456,
+        ts_exchange="1757908892351",
+        condition_id="condition-1",
+        asset_id=asset_id,
+        event_type=event_type,
+        side=side,
+        price=Decimal(price),
+        size=Decimal(size),
+        seq_or_hash=seq,
+    )

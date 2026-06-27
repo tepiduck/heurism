@@ -262,13 +262,15 @@ class StatusTrackingRecorder(ParquetRecorder):
         data_dir: Path,
         state: CollectorStateStore,
         venue_by_identifier: Mapping[str, str],
-        buffer_size: int = 1_000,
-        flush_interval_seconds: float = 5.0,
+        buffer_size: int = 10_000,
+        flush_interval_seconds: float = 60.0,
+        max_recorded_depth: int | None = 10,
     ) -> None:
         super().__init__(
             data_dir=data_dir,
             buffer_size=buffer_size,
             flush_interval_seconds=flush_interval_seconds,
+            max_recorded_depth=max_recorded_depth,
         )
         self._state = state
         self._venue_by_identifier = dict(venue_by_identifier)
@@ -281,8 +283,8 @@ class StatusTrackingRecorder(ParquetRecorder):
     def record_many(self, events: Iterable[NormalizedEvent]) -> None:
         """Record many events and update harvest status."""
         event_tuple = tuple(events)
+        ParquetRecorder.record_many(self, event_tuple)
         for event in event_tuple:
-            ParquetRecorder.record(self, event)
             self._observe(event)
 
     def _observe(self, event: NormalizedEvent) -> None:
@@ -437,6 +439,9 @@ async def run_harvest(*, request: HarvestRequest, settings: Settings) -> None:
             data_dir=data_dir,
             state=state,
             venue_by_identifier=selection.venue_by_identifier(),
+            buffer_size=settings.RAW_RECORDER_BUFFER_SIZE,
+            flush_interval_seconds=settings.RECORDER_FLUSH_INTERVAL_SECONDS,
+            max_recorded_depth=settings.MAX_RECORDED_DEPTH,
         )
         recorder.record_many(selection.metadata)
         recorder.flush_all()

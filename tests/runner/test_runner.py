@@ -122,6 +122,51 @@ def test_signal_logging_records_snapshot_batch_atomically(tmp_path) -> None:
     assert frame["kalshi_probability"].to_list() == [Decimal("0.6050000000")]
 
 
+def test_signal_logging_depth_cap_does_not_change_midpoint(tmp_path) -> None:
+    writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=100, flush_interval_seconds=999)
+    observer = SignalEventObserver(pairs=(PAIR,), signal_writer=writer)
+    recorder = SignalLoggingRecorder(
+        data_dir=tmp_path,
+        observer=observer,
+        buffer_size=100,
+        flush_interval_seconds=999,
+        max_recorded_depth=1,
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.BID, "0.59", "10"),
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.BID, "0.58", "10"),
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.ASK, "0.62", "10"),
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.ASK, "0.61", "10"),
+        )
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.BID, "0.60", "100"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.BID, "0.59", "100"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.98", "100"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.61", "100"),
+        )
+    )
+    recorder.flush_all()
+
+    signal_frame = pl.read_parquet(
+        list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
+    )
+    pm_frame = pl.read_parquet(
+        list(tmp_path.glob("raw/book/date=*/market=pm-condition/*.parquet"))
+    )
+    kalshi_frame = pl.read_parquet(list(tmp_path.glob("raw/book/date=*/market=KXTEST/*.parquet")))
+
+    assert signal_frame["polymarket_probability"].to_list() == [Decimal("0.6000000000")]
+    assert signal_frame["kalshi_probability"].to_list() == [Decimal("0.6050000000")]
+    assert pm_frame["price"].to_list() == [Decimal("0.5900000000"), Decimal("0.6100000000")]
+    assert kalshi_frame["price"].to_list() == [
+        Decimal("0.6000000000"),
+        Decimal("0.6100000000"),
+    ]
+
+
 def test_signal_logging_static_prices_write_one_signal_row(tmp_path) -> None:
     writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=100, flush_interval_seconds=999)
     observer = SignalEventObserver(
