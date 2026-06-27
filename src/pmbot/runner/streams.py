@@ -9,13 +9,15 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import polars as pl
 
 from pmbot.ingestion.schemas import DECIMAL_PRECISION, DECIMAL_SCALE
 from pmbot.runner.models import ResolutionRecord, SignalRecord
-from pmbot.signals.cross_venue import SignalValue
+
+if TYPE_CHECKING:
+    from pmbot.signals.cross_venue import SignalValue
 
 SIGNAL_SCHEMA: pl.Schema = pl.Schema(
     cast(
