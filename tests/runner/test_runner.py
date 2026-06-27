@@ -6,8 +6,16 @@ from decimal import Decimal
 import polars as pl
 
 from pmbot.ingestion.clob import BackoffPolicy
-from pmbot.ingestion.schemas import BookEvent, BookEventType, BookSide, TradeEvent
+from pmbot.ingestion.schemas import (
+    BookEvent,
+    BookEventType,
+    BookSide,
+    GapEvent,
+    GapReason,
+    TradeEvent,
+)
 from pmbot.runner.allowlist import load_verified_pairs
+from pmbot.runner.collector import _record_startup_resolutions
 from pmbot.runner.models import CollectorStatus, ResolutionRecord, VenueStatus
 from pmbot.runner.orchestrator import CollectorOrchestrator
 from pmbot.runner.resolutions import ResolutionPoller, StaticResolutionSource
@@ -107,6 +115,67 @@ def test_signal_logging_keeps_bounded_recent_history(tmp_path) -> None:
     assert observer.recent_trade_count == 5
 
 
+def test_signal_logging_infers_venue_for_unmapped_polymarket_no_token(tmp_path) -> None:
+    writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=10_000, flush_interval_seconds=999)
+    state = CollectorStateStore(data_dir=tmp_path, pairs_tracked=1)
+    observer = SignalEventObserver(pairs=(PAIR,), signal_writer=writer, state=state)
+    polymarket_no_asset_id = "1234567890123456789012345678901234567890"
+
+    observer.observe(
+        book_event(
+            BASE_TS,
+            "0xabc123",
+            polymarket_no_asset_id,
+            BookSide.BID,
+            "0.49",
+            "10",
+        )
+    )
+    observer.observe(
+        GapEvent(
+            ts_local_ns=BASE_TS + 1,
+            ts_monotonic_ns=None,
+            ts_exchange=None,
+            condition_id="0xabc123",
+            asset_id=None,
+            reason=GapReason.MISSING_SNAPSHOT,
+            details="condition-level gap",
+            seq_or_hash=None,
+        )
+    )
+    observer.observe(
+        GapEvent(
+            ts_local_ns=BASE_TS + 2,
+            ts_monotonic_ns=None,
+            ts_exchange=None,
+            condition_id="pm-condition",
+            asset_id=polymarket_no_asset_id,
+            reason=GapReason.CONNECTION_LOST,
+            details="asset-level gap",
+            seq_or_hash=None,
+        )
+    )
+    observer.observe(
+        GapEvent(
+            ts_local_ns=BASE_TS + 3,
+            ts_monotonic_ns=None,
+            ts_exchange=None,
+            condition_id="KXUNMAPPED",
+            asset_id=None,
+            reason=GapReason.RECONNECT,
+            details="ticker-level gap",
+            seq_or_hash=None,
+        )
+    )
+
+    venues = {venue.venue: venue for venue in state.status.venues}
+
+    assert "unknown" not in venues
+    assert venues["polymarket"].frames_total == 1
+    assert len(venues["polymarket"].gap_timestamps_ns) == 2
+    assert len(venues["kalshi"].gap_timestamps_ns) == 1
+
+
 def test_resolution_poller_is_idempotent(tmp_path) -> None:
     async def run() -> None:
         record = ResolutionRecord(
@@ -127,6 +196,40 @@ def test_resolution_poller_is_idempotent(tmp_path) -> None:
         assert await poller.poll_once() == 1
         assert await poller.poll_once() == 0
         assert store.count == 1
+
+    asyncio.run(run())
+
+
+def test_startup_resolution_filter_skips_closed_pair_without_reconnect_churn(tmp_path) -> None:
+    async def run() -> None:
+        live_pair = VerifiedContractPair(
+            polymarket_condition_id="pm-live",
+            polymarket_asset_id="pm-live-yes",
+            kalshi_ticker="KXLIVE",
+            rationale="fixture",
+        )
+        record = ResolutionRecord(
+            venue="kalshi",
+            market_id=PAIR.kalshi_ticker,
+            resolved_outcome="yes",
+            resolved_at="2026-01-01T00:00:00Z",
+            fetched_at="2026-01-01T00:01:00Z",
+            raw_json=None,
+        )
+        state = CollectorStateStore(data_dir=tmp_path, pairs_tracked=2)
+        store = ResolutionParquetStore(data_dir=tmp_path)
+
+        live_pairs = await _record_startup_resolutions(
+            pairs=(PAIR, live_pair),
+            sources=(StaticResolutionSource((record,)),),
+            store=store,
+            state=state,
+        )
+
+        assert live_pairs == (live_pair,)
+        assert store.count == 1
+        assert state.status.resolutions_collected == 1
+        assert all(venue.reconnects == 0 for venue in state.status.venues)
 
     asyncio.run(run())
 

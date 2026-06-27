@@ -74,7 +74,11 @@ class SignalEventObserver:
         self._signal_writer.flush_all()
 
     def _apply_gap(self, event: GapEvent) -> None:
-        venue = self._venue_by_asset.get(event.asset_id or event.condition_id, "unknown")
+        venue = _venue_for_event(
+            venue_by_identifier=self._venue_by_asset,
+            asset_id=event.asset_id,
+            condition_id=event.condition_id,
+        )
         if self._state is not None:
             self._state.note_gap(venue, ts_local_ns=event.ts_local_ns)
         if event.asset_id is None:
@@ -98,7 +102,7 @@ class SignalEventObserver:
         if self._state is None:
             return
         self._state.note_frame(
-            self._venue_by_asset.get(asset_id, "unknown"),
+            _venue_for_identifier(asset_id, self._venue_by_asset),
             ts_local_ns=ts_local_ns,
         )
 
@@ -141,3 +145,42 @@ def _venue_map(pairs: tuple[VerifiedContractPair, ...]) -> dict[str, str]:
         venue_by_asset[pair.polymarket_condition_id] = "polymarket"
         venue_by_asset[pair.kalshi_ticker] = "kalshi"
     return venue_by_asset
+
+
+def _venue_for_event(
+    *,
+    venue_by_identifier: dict[str, str],
+    asset_id: str | None,
+    condition_id: str,
+) -> str:
+    for identifier in (asset_id, condition_id):
+        if identifier is None:
+            continue
+        venue = venue_by_identifier.get(identifier)
+        if venue is not None:
+            return venue
+    for identifier in (asset_id, condition_id):
+        if identifier is None:
+            continue
+        venue = _infer_venue(identifier)
+        if venue != "unknown":
+            return venue
+    return "unknown"
+
+
+def _venue_for_identifier(identifier: str, venue_by_identifier: dict[str, str]) -> str:
+    venue = venue_by_identifier.get(identifier)
+    if venue is not None:
+        return venue
+    return _infer_venue(identifier)
+
+
+def _infer_venue(identifier: str) -> str:
+    text = identifier.strip()
+    if text.casefold().startswith("0x"):
+        return "polymarket"
+    if len(text) >= 20 and text.isdecimal():
+        return "polymarket"
+    if text.upper().startswith("KX"):
+        return "kalshi"
+    return "unknown"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -29,12 +30,20 @@ from pmbot.ingestion.kalshi import (
     kalshi_websocket_headers,
 )
 from pmbot.runner.allowlist import load_verified_pairs
+from pmbot.runner.models import ResolutionRecord
 from pmbot.runner.orchestrator import CollectorOrchestrator
-from pmbot.runner.resolutions import GammaResolutionSource, KalshiResolutionSource, ResolutionPoller
+from pmbot.runner.resolutions import (
+    GammaResolutionSource,
+    KalshiResolutionSource,
+    ResolutionPoller,
+    ResolutionSource,
+)
 from pmbot.runner.signal_logging import SignalEventObserver, SignalLoggingRecorder
 from pmbot.runner.state import CollectorStateStore
 from pmbot.runner.streams import ResolutionParquetStore, SignalParquetWriter
 from pmbot.signals.contracts import VerifiedContractPair
+
+LOGGER = logging.getLogger(__name__)
 
 
 async def run_collector(
@@ -51,18 +60,6 @@ async def run_collector(
 
     data_dir = Path(settings.DATA_DIR)
     state = CollectorStateStore(data_dir=data_dir, pairs_tracked=len(pairs))
-    signal_writer = SignalParquetWriter(
-        data_dir=data_dir,
-        buffer_size=100,
-        flush_interval_seconds=30.0,
-    )
-    observer = SignalEventObserver(pairs=pairs, signal_writer=signal_writer, state=state)
-    recorder = SignalLoggingRecorder(
-        data_dir=data_dir,
-        observer=observer,
-        buffer_size=100,
-        flush_interval_seconds=30.0,
-    )
     resolution_store = ResolutionParquetStore(data_dir=data_dir)
 
     async with httpx.AsyncClient(timeout=20.0) as http:
@@ -76,35 +73,67 @@ async def run_collector(
             http=http,
             auth=kalshi_auth,
         )
-        poller = ResolutionPoller(
+        resolution_sources: tuple[ResolutionSource, ...] = (
+            GammaResolutionSource(gamma),
+            KalshiResolutionSource(kalshi_metadata),
+        )
+        live_pairs = await _record_startup_resolutions(
             pairs=pairs,
-            sources=(
-                GammaResolutionSource(gamma),
-                KalshiResolutionSource(kalshi_metadata),
-            ),
+            sources=resolution_sources,
             store=resolution_store,
             state=state,
         )
-        orchestrator = CollectorOrchestrator(
-            venue_tasks=(
+
+        signal_writer = SignalParquetWriter(
+            data_dir=data_dir,
+            buffer_size=100,
+            flush_interval_seconds=30.0,
+        )
+        observer = SignalEventObserver(pairs=live_pairs, signal_writer=signal_writer, state=state)
+        recorder = SignalLoggingRecorder(
+            data_dir=data_dir,
+            observer=observer,
+            buffer_size=100,
+            flush_interval_seconds=30.0,
+        )
+        poller = (
+            ResolutionPoller(
+                pairs=live_pairs,
+                sources=resolution_sources,
+                store=resolution_store,
+                state=state,
+            )
+            if live_pairs
+            else None
+        )
+        venue_tasks = (
+            (
                 PolymarketVenueTask(
-                    pairs=pairs,
+                    pairs=live_pairs,
                     recorder=recorder,
                     gamma=gamma,
                     clob_http=ClobHttpClient(
-                        base_url=_url_or_default(settings.CLOB_HTTP_URL, DEFAULT_CLOB_HTTP_URL),
+                        base_url=_url_or_default(
+                            settings.CLOB_HTTP_URL,
+                            DEFAULT_CLOB_HTTP_URL,
+                        ),
                         http=http,
                     ),
                     ws_url=_url_or_default(settings.CLOB_WS_URL, DEFAULT_CLOB_WS_URL),
                 ),
                 KalshiVenueTask(
-                    pairs=pairs,
+                    pairs=live_pairs,
                     recorder=recorder,
                     metadata=kalshi_metadata,
                     ws_url=KALSHI_WS_URL,
                     auth=kalshi_auth,
                 ),
-            ),
+            )
+            if live_pairs
+            else ()
+        )
+        orchestrator = CollectorOrchestrator(
+            venue_tasks=venue_tasks,
             resolution_poller=poller,
             state=state,
             backoff=BackoffPolicy(),
@@ -114,6 +143,37 @@ async def run_collector(
             await orchestrator.run(duration_seconds=duration_seconds)
         finally:
             recorder.flush_all()
+
+
+async def _record_startup_resolutions(
+    *,
+    pairs: tuple[VerifiedContractPair, ...],
+    sources: tuple[ResolutionSource, ...],
+    store: ResolutionParquetStore,
+    state: CollectorStateStore | None = None,
+) -> tuple[VerifiedContractPair, ...]:
+    records: list[ResolutionRecord] = []
+    for source in sources:
+        try:
+            records.extend(await source.fetch(pairs))
+        except Exception:
+            LOGGER.warning(
+                "startup resolution source %s failed; continuing with live subscriptions",
+                type(source).__name__,
+                exc_info=True,
+            )
+    written = store.record_many(records)
+    if state is not None:
+        state.note_resolutions(written)
+    resolved_market_ids = {record.market_id for record in records}
+    return tuple(pair for pair in pairs if not _pair_is_resolved(pair, resolved_market_ids))
+
+
+def _pair_is_resolved(pair: VerifiedContractPair, resolved_market_ids: set[str]) -> bool:
+    return (
+        pair.polymarket_condition_id in resolved_market_ids
+        or pair.kalshi_ticker in resolved_market_ids
+    )
 
 
 class PolymarketVenueTask:
