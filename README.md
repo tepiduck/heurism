@@ -20,6 +20,53 @@ Check freshness and heartbeat state:
 pmbot status
 ```
 
+## Raw Harvest Mode
+
+Use `pmbot harvest` for generic single-venue raw dataset building. Harvest mode
+records normalized order books, trades, gap logs, metadata, and optional
+resolved outcomes under `data/raw/`, but it does not construct cross-venue
+pairs, run contract mapping or resolution-criteria verification, compute
+signals, place orders, or touch execution paths.
+
+Select targeted markets explicitly:
+
+```bash
+pmbot harvest \
+  --polymarket-markets path/to/polymarket_ids.txt \
+  --kalshi-tickers path/to/kalshi_tickers.txt \
+  --duration 300
+```
+
+Each Polymarket list row may contain condition IDs or numeric CLOB token/asset
+IDs. Each Kalshi list row contains market tickers. Blank lines and `#` comments
+are ignored, and comma-separated identifiers are accepted.
+
+You can also harvest targeted groups:
+
+```bash
+pmbot harvest \
+  --kalshi-series KXWCGAME \
+  --polymarket-series soccer-fifwc \
+  --data-dir data/harvest_wc \
+  --status-file data/harvest_wc/status.json \
+  --poll-resolutions
+```
+
+Check the separate harvest heartbeat with:
+
+```bash
+pmbot harvest-status --data-dir data/harvest_wc --status-file data/harvest_wc/status.json
+```
+
+Harvest runs can use a different `--data-dir` and `--status-file` from the
+strategy collector, so both processes can run independently without clobbering
+each other's `status.json`.
+
+There is intentionally no default "all active markets" harvest. Subscribing to
+thousands of live markets can hit websocket and connection limits and flood
+disk. Prefer explicit lists, venue series, or Polymarket tag/series slugs. If an
+all-active mode is added later, it should batch subscriptions and warn loudly.
+
 ## Run 24/7 On macOS
 
 The launchd template lives at `ops/launchd/com.pmbot.collector.plist`. Replace

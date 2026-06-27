@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from pmbot.ingestion.clob import BackoffPolicy
-from pmbot.runner.resolutions import ResolutionPoller
 from pmbot.runner.state import CollectorStateStore
 
 LOGGER = logging.getLogger(__name__)
@@ -24,13 +23,20 @@ class VenueTask(Protocol):
         """Run until cancelled, disconnected, or failed."""
 
 
+class PollerTask(Protocol):
+    """A supervised periodic read-only task."""
+
+    async def poll_once(self) -> int:
+        """Run one polling pass and return newly persisted records."""
+
+
 @dataclass(frozen=True, slots=True)
 class CollectorOrchestrator:
     """Run venue ingestion and resolution polling under independent supervisors."""
 
     venue_tasks: tuple[VenueTask, ...]
     state: CollectorStateStore
-    resolution_poller: ResolutionPoller | None = None
+    resolution_poller: PollerTask | None = None
     backoff: BackoffPolicy = BackoffPolicy(initial_seconds=1.0, max_seconds=30.0)
     resolution_interval_seconds: float = 900.0
 

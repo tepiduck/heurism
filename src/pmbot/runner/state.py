@@ -12,6 +12,7 @@ from typing import Any
 from pmbot.runner.models import CollectorStatus, VenueStatus
 
 STATUS_RELATIVE_PATH = Path("collector") / "status.json"
+HARVEST_STATUS_RELATIVE_PATH = Path("harvest") / "status.json"
 ONE_HOUR_NS = 3_600_000_000_000
 ONE_DAY_NS = 86_400_000_000_000
 
@@ -19,8 +20,15 @@ ONE_DAY_NS = 86_400_000_000_000
 class CollectorStateStore:
     """Small JSON state file for operator status."""
 
-    def __init__(self, *, data_dir: Path, pairs_tracked: int) -> None:
-        self._path = data_dir / STATUS_RELATIVE_PATH
+    def __init__(
+        self,
+        *,
+        data_dir: Path,
+        pairs_tracked: int,
+        status_path: Path | None = None,
+        relative_path: Path = STATUS_RELATIVE_PATH,
+    ) -> None:
+        self._path = status_path or data_dir / relative_path
         self._status = self._load() or CollectorStatus(
             started_at_ns=time.time_ns(),
             updated_at_ns=time.time_ns(),
@@ -145,9 +153,14 @@ class CollectorStateStore:
         return _load_status_path(self._path)
 
 
-def load_status(data_dir: Path) -> CollectorStatus | None:
+def load_status(
+    data_dir: Path,
+    *,
+    status_path: Path | None = None,
+    relative_path: Path = STATUS_RELATIVE_PATH,
+) -> CollectorStatus | None:
     """Load status without mutating it."""
-    return _load_status_path(data_dir / STATUS_RELATIVE_PATH)
+    return _load_status_path(status_path or data_dir / relative_path)
 
 
 def _load_status_path(path: Path) -> CollectorStatus | None:
@@ -179,7 +192,12 @@ def _load_status_path(path: Path) -> CollectorStatus | None:
         return None
 
 
-def render_status(status: CollectorStatus | None, *, now_ns: int | None = None) -> str:
+def render_status(
+    status: CollectorStatus | None,
+    *,
+    now_ns: int | None = None,
+    tracked_label: str = "pairs tracked",
+) -> str:
     """Render status text for CLI and tests."""
     if status is None:
         return "Collector status unavailable: no status file found."
@@ -187,7 +205,7 @@ def render_status(status: CollectorStatus | None, *, now_ns: int | None = None) 
     lines = [
         "pmbot collector status",
         f"uptime: {_format_duration_ns(max(0, now - status.started_at_ns))}",
-        f"pairs tracked: {status.pairs_tracked}",
+        f"{tracked_label}: {status.pairs_tracked}",
         f"resolutions collected: {status.resolutions_collected}",
     ]
     for venue in status.venues:

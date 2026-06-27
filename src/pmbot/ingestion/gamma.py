@@ -55,6 +55,7 @@ class GammaClient:
         self,
         *,
         series_slug: str | None = None,
+        tag_slug: str | None = None,
         active: bool | None = None,
         closed: bool | None = None,
         limit: int = 100,
@@ -64,6 +65,8 @@ class GammaClient:
         params: dict[str, str | int | bool] = {"limit": limit, "offset": offset}
         if series_slug is not None:
             params["series_slug"] = series_slug
+        if tag_slug is not None:
+            params["tag_slug"] = tag_slug
         if active is not None:
             params["active"] = active
         if closed is not None:
