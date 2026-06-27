@@ -160,7 +160,7 @@ class WorldCupAllowlistRefresher:
         )
         self.registry.replace(next_pairs)
         if self.pair_store is not None:
-            self.pair_store.save(next_pairs)
+            self.pair_store.save(next_pairs, merge_existing=True)
         if self.observer is not None:
             self.observer.set_pairs(next_pairs)
         if self.state is not None:

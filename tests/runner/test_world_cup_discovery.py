@@ -94,6 +94,7 @@ def test_world_cup_refresh_adds_new_pairs_and_drops_resolved(tmp_path) -> None:
         new_pair = _pair("0xnew", "new-yes", "new-no", "KXWCGAME-26JUN27NEW-NEW")
         registry = PairRegistry((old_pair, keep_pair))
         pair_store = CollectedPairStore(data_dir=tmp_path)
+        pair_store.save((old_pair, keep_pair))
         state = CollectorStateStore(data_dir=tmp_path, pairs_tracked=2)
         store = ResolutionParquetStore(data_dir=tmp_path)
         record = ResolutionRecord(
@@ -117,7 +118,7 @@ def test_world_cup_refresh_adds_new_pairs_and_drops_resolved(tmp_path) -> None:
 
         assert refreshed == (keep_pair, new_pair)
         assert registry.snapshot() == (keep_pair, new_pair)
-        assert pair_store.load() == (keep_pair, new_pair)
+        assert pair_store.load() == (keep_pair, new_pair, old_pair)
         assert store.count == 1
         assert state.status.resolutions_collected == 1
         assert state.status.pairs_tracked == 2

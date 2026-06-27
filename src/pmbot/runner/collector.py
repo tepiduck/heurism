@@ -67,6 +67,7 @@ async def run_collector(
     data_dir = Path(settings.DATA_DIR)
     state = CollectorStateStore(data_dir=data_dir, pairs_tracked=len(pairs))
     pair_store = CollectedPairStore(data_dir=data_dir)
+    pair_store.save(pairs, merge_existing=True)
     resolution_store = ResolutionParquetStore(data_dir=data_dir)
 
     async with httpx.AsyncClient(timeout=20.0) as http:
@@ -91,7 +92,7 @@ async def run_collector(
             state=state,
         )
         registry = PairRegistry(live_pairs)
-        pair_store.save(registry.snapshot())
+        pair_store.save(registry.snapshot(), merge_existing=True)
         state.set_pairs_tracked(len(registry.snapshot()))
 
         signal_writer = SignalParquetWriter(

@@ -154,6 +154,7 @@ class RawReplayData:
 def _load_eval_pairs(
     config: EvalRunConfig,
     replay: RawReplayData,
+    outcomes: Mapping[tuple[str, str], int],
 ) -> tuple[tuple[VerifiedContractPair, ...], dict[str, object]]:
     """Load verified pairs that correspond to markets actually present in raw books."""
     static_pairs = _load_static_allowlist_pairs(config.allowlist_path)
@@ -178,7 +179,7 @@ def _load_eval_pairs(
         combined[key] = pair
         source_by_key[key] = "recorded_world_cup_metadata"
 
-    collected_pairs = tuple(
+    raw_history_pairs = tuple(
         sorted(
             (
                 pair
@@ -188,11 +189,23 @@ def _load_eval_pairs(
             key=lambda pair: (pair.kalshi_ticker, pair.polymarket_condition_id),
         )
     )
+    scoreable_pairs = tuple(
+        pair for pair in raw_history_pairs if _realized_for_pair(pair, outcomes) is not None
+    )
+    selected_pairs = scoreable_pairs or raw_history_pairs
+    binary_resolution_keys = set(outcomes)
+    reconstructed_resolution_keys = {
+        resolution_key
+        for pair in combined.values()
+        for resolution_key in _resolution_keys(pair)
+        if resolution_key in binary_resolution_keys
+    }
     source: dict[str, object] = {
         "pair_selection": (
             "static allowlist plus collector persisted verified pairs plus reconstructed "
-            "recorded World Cup metadata, filtered to pairs whose Polymarket YES asset and "
-            "Kalshi ticker both appear in raw books"
+            "recorded World Cup metadata. Eval scores pairs with raw book history and a "
+            "non-empty binary resolution; when none exist it replays raw-history pairs for "
+            "diagnostics."
         ),
         "allowlist_path": str(config.allowlist_path),
         "collector_pair_store_path": str(collected_store.path),
@@ -200,24 +213,35 @@ def _load_eval_pairs(
         "collector_pair_store_pairs_loaded": len(stored_pairs),
         "recorded_metadata_pairs_loaded": len(metadata_pairs),
         "candidate_pairs_loaded": len(combined),
-        "collected_pairs_selected": len(collected_pairs),
+        "raw_history_pairs": len(raw_history_pairs),
+        "scoreable_pairs_selected": len(scoreable_pairs),
+        "selected_pairs_for_replay": len(selected_pairs),
+        "selected_pairs_are_scoreable": bool(scoreable_pairs),
+        "binary_resolution_markets": len(binary_resolution_keys),
+        "binary_resolution_markets_with_reconstructed_pair": len(reconstructed_resolution_keys),
         "raw_book_assets_seen": len(raw_assets),
         "raw_book_conditions_seen": len(raw_conditions),
         "selected_pair_sources": dict(
-            sorted(Counter(source_by_key[_pair_key(pair)] for pair in collected_pairs).items())
+            sorted(Counter(source_by_key[_pair_key(pair)] for pair in selected_pairs).items())
+        ),
+        "scoreable_markets": _pair_market_summaries(scoreable_pairs),
+        "binary_resolution_keys_without_reconstructed_pair": _resolution_key_dicts(
+            tuple(sorted(binary_resolution_keys - reconstructed_resolution_keys))
         ),
         "recorded_metadata": metadata_source,
     }
     LOGGER.info(
-        "eval: selected %s collected pairs (%s static, %s stored, %s metadata-derived, "
-        "%s candidates)",
-        len(collected_pairs),
+        "eval: selected %s replay pairs (%s scoreable, %s raw-history; %s static, "
+        "%s stored, %s metadata-derived, %s candidates)",
+        len(selected_pairs),
+        len(scoreable_pairs),
+        len(raw_history_pairs),
         len(static_pairs),
         len(stored_pairs),
         len(metadata_pairs),
         len(combined),
     )
-    return collected_pairs, source
+    return selected_pairs, source
 
 
 def _load_static_allowlist_pairs(path: Path) -> tuple[VerifiedContractPair, ...]:
@@ -256,6 +280,8 @@ def _load_recorded_world_cup_pairs(
     )
     polymarket_markets: dict[str, Mapping[str, object]] = {}
     kalshi_markets: dict[str, Mapping[str, object]] = {}
+    historical_polymarket_markets: dict[str, Mapping[str, object]] = {}
+    historical_kalshi_markets: dict[str, Mapping[str, object]] = {}
     for condition_id, raw_json in frame.iter_rows(named=False):
         raw = _json_mapping(raw_json)
         if raw is None:
@@ -266,19 +292,34 @@ def _load_recorded_world_cup_pairs(
             enriched.setdefault("ticker", str(condition_id))
         if _metadata_row_looks_polymarket(enriched):
             polymarket_markets[_metadata_market_id(enriched, fallback=str(condition_id))] = enriched
+            historical = _historical_world_cup_market(enriched, venue="polymarket")
+            historical_polymarket_markets[
+                _metadata_market_id(enriched, fallback=str(condition_id))
+            ] = historical
         if _metadata_row_looks_kalshi(enriched):
             kalshi_markets[_metadata_market_id(enriched, fallback=str(condition_id))] = enriched
+            historical = _historical_world_cup_market(enriched, venue="kalshi")
+            historical_kalshi_markets[_metadata_market_id(enriched, fallback=str(condition_id))] = (
+                historical
+            )
 
-    pairs = match_world_cup_match_winner_markets(
+    live_pairs = match_world_cup_match_winner_markets(
         tuple(polymarket_markets.values()),
         tuple(kalshi_markets.values()),
     )
+    historical_pairs = match_world_cup_match_winner_markets(
+        tuple(historical_polymarket_markets.values()),
+        tuple(historical_kalshi_markets.values()),
+    )
+    pairs = _dedupe_eval_pairs((*live_pairs, *historical_pairs))
     source: dict[str, object] = {
         "metadata_files_scanned": len(files),
         "metadata_market_partitions_requested": len(raw_conditions),
         "metadata_rows_loaded": frame.height,
         "polymarket_markets_loaded": len(polymarket_markets),
         "kalshi_markets_loaded": len(kalshi_markets),
+        "live_pairs_matched": len(live_pairs),
+        "historical_pairs_matched": len(historical_pairs),
         "pairs_matched": len(pairs),
     }
     LOGGER.info(
@@ -288,6 +329,32 @@ def _load_recorded_world_cup_pairs(
         len(kalshi_markets),
     )
     return pairs, source
+
+
+def _historical_world_cup_market(
+    raw: Mapping[str, object],
+    *,
+    venue: str,
+) -> Mapping[str, object]:
+    """Make a metadata snapshot matchable for eval even if it is now settled."""
+    historical = dict(raw)
+    for key in (
+        "resolved_outcome",
+        "resolvedOutcome",
+        "winningOutcome",
+        "winner",
+        "result",
+        "resolution",
+        "outcome",
+    ):
+        historical.pop(key, None)
+    if venue == "polymarket":
+        historical["active"] = True
+        historical["closed"] = False
+        historical["acceptingOrders"] = True
+    if venue == "kalshi":
+        historical["status"] = "open"
+    return historical
 
 
 def _metadata_parquet_files(config: EvalRunConfig, market_ids: set[str]) -> tuple[Path, ...]:
@@ -344,6 +411,26 @@ def _pair_key(pair: VerifiedContractPair) -> tuple[str, str]:
     return pair.polymarket_condition_id, pair.kalshi_ticker
 
 
+def _dedupe_eval_pairs(
+    pairs: Sequence[VerifiedContractPair],
+) -> tuple[VerifiedContractPair, ...]:
+    by_key: dict[tuple[str, str], VerifiedContractPair] = {}
+    for pair in pairs:
+        by_key[_pair_key(pair)] = pair
+    return tuple(by_key[key] for key in sorted(by_key))
+
+
+def _pair_market_summaries(pairs: Sequence[VerifiedContractPair]) -> list[dict[str, str]]:
+    return [
+        {
+            "polymarket_condition_id": pair.polymarket_condition_id,
+            "polymarket_asset_id": pair.polymarket_asset_id,
+            "kalshi_ticker": pair.kalshi_ticker,
+        }
+        for pair in pairs
+    ]
+
+
 def run_eval(config: EvalRunConfig) -> dict[str, object]:
     """Run WP-4 evaluation from raw books and write an immutable JSON report."""
     if config.report_path.exists():
@@ -351,13 +438,13 @@ def run_eval(config: EvalRunConfig) -> dict[str, object]:
     replay = _load_raw_replay_data(config)
     if replay.row_count == 0:
         raise ValueError(f"no raw replay events found under {config.data_dir / 'raw'}")
-    pairs, pair_source = _load_eval_pairs(config, replay)
+    outcomes = _load_resolution_outcomes(config.data_dir)
+    pairs, pair_source = _load_eval_pairs(config, replay, outcomes)
     if not pairs:
         raise ValueError(
             "no collected verified pairs available for eval; "
             f"source={pair_source}"
         )
-    outcomes = _load_resolution_outcomes(config.data_dir)
     decisions, signal_count = _recompute_observation_decisions(
         replay=replay,
         pairs=pairs,
@@ -796,6 +883,7 @@ def _manifest_payload(
             ),
         },
         "n_pairs_loaded": len(pairs),
+        "n_scoreable_pairs": _source_int(pair_source, "scoreable_pairs_selected"),
         "n_raw_book_events": replay.row_count,
         "n_raw_book_files_scanned": replay.files_scanned,
         "n_recomputed_signal_rows": signal_count,
@@ -847,6 +935,7 @@ def _diagnostic_payload(
             "message": "No resolved, guard-passing observations were available.",
         },
         "n_pairs_loaded": len(pairs),
+        "n_scoreable_pairs": _source_int(pair_source, "scoreable_pairs_selected"),
         "n_raw_book_events": replay.row_count,
         "n_raw_book_files_scanned": replay.files_scanned,
         "n_recomputed_signal_rows": signal_count,
@@ -946,6 +1035,11 @@ def _pair_diagnostics(
 
 def _resolution_key_dicts(keys: Sequence[tuple[str, str]]) -> list[dict[str, str]]:
     return [{"venue": venue, "market_id": market_id} for venue, market_id in keys]
+
+
+def _source_int(source: Mapping[str, object], key: str) -> int:
+    value = source.get(key)
+    return value if isinstance(value, int) else 0
 
 
 def _guard_summary(decisions: Sequence[EvalObservationDecision]) -> dict[str, object]:

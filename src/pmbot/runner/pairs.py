@@ -85,12 +85,18 @@ class CollectedPairStore:
         """Return the JSONL path used by this store."""
         return self._path
 
-    def save(self, pairs: tuple[VerifiedContractPair, ...]) -> None:
-        """Atomically persist the current effective pair set."""
+    def save(
+        self,
+        pairs: tuple[VerifiedContractPair, ...],
+        *,
+        merge_existing: bool = False,
+    ) -> None:
+        """Atomically persist pairs, optionally unioning with the historical set."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        effective_pairs = (*self.load(), *pairs) if merge_existing else pairs
         tmp_path = self._path.with_name(f"{self._path.name}.{time.time_ns()}.tmp")
         with tmp_path.open("w", encoding="utf-8") as handle:
-            for pair in _dedupe_pairs(pairs):
+            for pair in _dedupe_pairs(effective_pairs):
                 handle.write(json.dumps(asdict(pair), sort_keys=True) + "\n")
         tmp_path.replace(self._path)
 

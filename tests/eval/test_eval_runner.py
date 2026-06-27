@@ -242,7 +242,57 @@ def test_eval_runner_scores_metadata_discovered_collected_pairs(tmp_path) -> Non
     assert payload["n_observations"] == 1
     assert payload["source"]["pair_source"]["static_pairs_loaded"] == 0
     assert payload["source"]["pair_source"]["recorded_metadata_pairs_loaded"] == 1
-    assert payload["source"]["pair_source"]["collected_pairs_selected"] == 1
+    assert payload["source"]["pair_source"]["raw_history_pairs"] == 1
+    assert payload["source"]["pair_source"]["scoreable_pairs_selected"] == 1
+
+
+def test_eval_runner_scores_settled_pair_from_historical_metadata(tmp_path) -> None:
+    allowlist = tmp_path / "pairs.jsonl"
+    report = tmp_path / "settled-metadata.json"
+    allowlist.write_text("", encoding="utf-8")
+    write_metadata(
+        tmp_path,
+        polymarket_metadata(
+            condition_id="pm-settled",
+            yes_token="pm-settled-yes",
+            no_token="pm-settled-no",
+            closed=True,
+            resolved_outcome="yes",
+        ),
+        kalshi_metadata(
+            "KXWCGAME-26JUN25ABCDEF-ABC",
+            status="settled",
+            expiration_value="Alfa",
+        ),
+    )
+    write_books(
+        tmp_path,
+        [
+            *snapshot(BASE_TS, "pm-settled", "pm-settled-yes", bid="0.49", ask="0.51"),
+            *snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN25ABCDEF-ABC",
+                "KXWCGAME-26JUN25ABCDEF-ABC",
+                bid="0.59",
+                ask="0.61",
+            ),
+        ],
+    )
+    write_resolutions(tmp_path, ("kalshi", "KXWCGAME-26JUN25ABCDEF-ABC", "yes"))
+
+    payload = run_eval(
+        EvalRunConfig(
+            data_dir=tmp_path,
+            report_path=report,
+            allowlist_path=allowlist,
+            bootstrap_samples=0,
+        )
+    )
+
+    assert payload["n_observations"] == 1
+    assert payload["source"]["pair_source"]["recorded_metadata"]["live_pairs_matched"] == 0
+    assert payload["source"]["pair_source"]["recorded_metadata"]["historical_pairs_matched"] == 1
+    assert payload["source"]["pair_source"]["scoreable_pairs_selected"] == 1
 
 
 def test_eval_runner_scores_collector_persisted_pairs(tmp_path) -> None:
@@ -282,10 +332,77 @@ def test_eval_runner_scores_collector_persisted_pairs(tmp_path) -> None:
     )
 
     assert payload["n_observations"] == 1
+    assert payload["n_scoreable_pairs"] == 1
     assert payload["source"]["pair_source"]["collector_pair_store_pairs_loaded"] == 1
     assert payload["source"]["pair_source"]["selected_pair_sources"] == {
         "collector_verified_pair_store": 1
     }
+
+
+def test_eval_runner_prefers_scoreable_history_over_unsettled_live_pairs(tmp_path) -> None:
+    allowlist = tmp_path / "pairs.jsonl"
+    report = tmp_path / "scoreable-only.json"
+    allowlist.write_text("", encoding="utf-8")
+    settled_pair = VerifiedContractPair(
+        polymarket_condition_id="pm-settled",
+        polymarket_asset_id="pm-settled-yes",
+        kalshi_ticker="KXWCGAME-26JUN25SETTLED-SET",
+        rationale="historical discovered pair",
+    )
+    live_pair = VerifiedContractPair(
+        polymarket_condition_id="pm-live",
+        polymarket_asset_id="pm-live-yes",
+        kalshi_ticker="KXWCGAME-26JUN27LIVE-LIV",
+        rationale="current discovered pair",
+    )
+    CollectedPairStore(data_dir=tmp_path).save((settled_pair, live_pair))
+    write_books(
+        tmp_path,
+        [
+            *snapshot(BASE_TS, "pm-settled", "pm-settled-yes", bid="0.49", ask="0.51"),
+            *snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN25SETTLED-SET",
+                "KXWCGAME-26JUN25SETTLED-SET",
+                bid="0.59",
+                ask="0.61",
+            ),
+            *snapshot(BASE_TS, "pm-live", "pm-live-yes", bid="0.49", ask="0.51"),
+            *snapshot(
+                BASE_TS + 1,
+                "KXWCGAME-26JUN27LIVE-LIV",
+                "KXWCGAME-26JUN27LIVE-LIV",
+                bid="0.69",
+                ask="0.71",
+            ),
+        ],
+    )
+    write_resolutions(
+        tmp_path,
+        ("kalshi", "KXWCGAME-26JUN25SETTLED-SET", "yes"),
+        ("kalshi", "KXWCGAME-26JUN27LIVE-LIV", ""),
+    )
+
+    payload = run_eval(
+        EvalRunConfig(
+            data_dir=tmp_path,
+            report_path=report,
+            allowlist_path=allowlist,
+            bootstrap_samples=0,
+        )
+    )
+
+    assert payload["n_pairs_loaded"] == 1
+    assert payload["n_scoreable_pairs"] == 1
+    assert payload["n_observations"] == 1
+    assert payload["source"]["pair_source"]["raw_history_pairs"] == 2
+    assert payload["source"]["pair_source"]["scoreable_markets"] == [
+        {
+            "polymarket_condition_id": "pm-settled",
+            "polymarket_asset_id": "pm-settled-yes",
+            "kalshi_ticker": "KXWCGAME-26JUN25SETTLED-SET",
+        }
+    ]
 
 
 def write_books(tmp_path, events: list[BookEvent]) -> None:
@@ -330,19 +447,23 @@ def polymarket_metadata(
     condition_id: str,
     yes_token: str,
     no_token: str,
+    closed: bool = False,
+    resolved_outcome: str | None = None,
 ) -> MetadataSnapshot:
     raw = {
         "conditionId": condition_id,
         "question": "Will Alfa win on 2026-06-25?",
         "outcomes": ["Yes", "No"],
         "clobTokenIds": [yes_token, no_token],
-        "active": True,
-        "closed": False,
-        "acceptingOrders": True,
+        "active": not closed,
+        "closed": closed,
+        "acceptingOrders": not closed,
         "slug": "fifwc-abc-def-2026-06-25-abc",
         "__event_slug": "fifwc-abc-def-2026-06-25",
         "__event_title": "Alfa vs Delta Winner?",
     }
+    if resolved_outcome is not None:
+        raw["resolved_outcome"] = resolved_outcome
     return MetadataSnapshot(
         fetched_at="2026-06-25T12:00:00Z",
         condition_id=condition_id,
@@ -350,21 +471,27 @@ def polymarket_metadata(
         outcomes=("Yes", "No"),
         token_ids=(yes_token, no_token),
         resolution_or_end_time=None,
-        active=True,
-        closed=False,
+        active=not closed,
+        closed=closed,
         liquidity=None,
         volume=None,
         raw_json=json.dumps(raw),
     )
 
 
-def kalshi_metadata(ticker: str) -> MetadataSnapshot:
+def kalshi_metadata(
+    ticker: str,
+    *,
+    status: str = "open",
+    expiration_value: str = "",
+) -> MetadataSnapshot:
     raw = {
         "ticker": ticker,
         "title": "Alfa vs Delta Winner?",
         "yes_sub_title": "Reg Time: Alfa",
-        "status": "open",
+        "status": status,
         "expiration_time": "2026-06-25T23:00:00Z",
+        "expiration_value": expiration_value,
     }
     return MetadataSnapshot(
         fetched_at="2026-06-25T12:00:00Z",
@@ -373,8 +500,8 @@ def kalshi_metadata(ticker: str) -> MetadataSnapshot:
         outcomes=("yes", "no"),
         token_ids=(ticker,),
         resolution_or_end_time=None,
-        active=True,
-        closed=False,
+        active=status in {"open", "active"},
+        closed=status not in {"open", "active"},
         liquidity=None,
         volume=None,
         raw_json=json.dumps(raw),
