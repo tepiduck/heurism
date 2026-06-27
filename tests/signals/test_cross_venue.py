@@ -481,7 +481,7 @@ def kalshi_snapshot(
             KALSHI_TICKER,
             BookSide.BID,
             bid,
-            size,
+            str(Decimal(size) * Decimal(bid)),
             exchange_ts=exchange_ts,
         ),
         book_event(
@@ -490,7 +490,7 @@ def kalshi_snapshot(
             KALSHI_TICKER,
             BookSide.ASK,
             ask,
-            size,
+            str(Decimal(size) * Decimal(ask)),
             exchange_ts=exchange_ts,
         ),
     )

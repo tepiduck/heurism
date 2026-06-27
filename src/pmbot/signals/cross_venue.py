@@ -21,7 +21,7 @@ from enum import StrEnum
 
 from pmbot.backtest.engine import PointInTimeView
 from pmbot.backtest.models import BookSnapshot
-from pmbot.features.orderbook import microprice
+from pmbot.features.orderbook import BookSizeUnit, microprice
 from pmbot.ingestion.schemas import BookEvent, BookSide
 from pmbot.signals.contracts import VerifiedContractPair
 
@@ -253,7 +253,7 @@ class CrossVenueSignal:
         pm_yes_book = view.book(pair.polymarket_asset_id)
         kalshi_book = view.book(pair.kalshi_ticker)
         pm_mid = microprice(pm_yes_book)
-        kalshi_mid = microprice(kalshi_book)
+        kalshi_mid = microprice(kalshi_book, size_unit=BookSizeUnit.DOLLAR_NOTIONAL)
         if pm_mid is None or kalshi_mid is None:
             return None
         if pair.invert_kalshi:
