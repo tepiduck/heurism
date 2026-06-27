@@ -20,6 +20,27 @@ Check freshness and heartbeat state:
 pmbot status
 ```
 
+## Evaluation
+
+Produce a WP-4 preliminary edge read from recorded raw books and resolutions:
+
+```bash
+pmbot eval --data-dir data --report out.json
+```
+
+The eval runner replays `data/raw/book` through the current cross-venue signal
+code and joins the recomputed p-hat series to `data/resolutions`. It does not
+read `data/signals`, because that history can mix model versions. The JSON
+report is immutable, includes a config hash, raw data time range, clustered
+proper-score metrics, calibration/ECE, explicit guard counts, and a loud
+`small_n` flag when the number of distinct resolved matches is below the
+configured verdict threshold.
+
+By default the runner uses `pairs.draft.jsonl` as the verified pair mapping.
+Override it with `--allowlist path/to/pairs.jsonl`. Regression fitting is off by
+default; `--fit-regression` will only fit once the configured minimum number of
+distinct resolved events is available.
+
 ## Raw Harvest Mode
 
 Use `pmbot harvest` for generic single-venue raw dataset building. Harvest mode

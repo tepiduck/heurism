@@ -24,6 +24,7 @@ from pmbot.eval.models import (
 )
 from pmbot.eval.pnl import pnl_metrics
 from pmbot.eval.report import build_evaluation_report
+from pmbot.eval.runner import EvalRunConfig, run_eval
 from pmbot.eval.scoring import brier_score, brier_skill, log_loss, score_forecasts
 from pmbot.eval.shortfall import implementation_shortfall
 from pmbot.eval.sweep import evaluate_candidate, select_parameter, sweep_train_test
@@ -36,6 +37,7 @@ __all__ = [
     "ClvSummary",
     "CrossVenueEvaluationObservation",
     "EvaluationReport",
+    "EvalRunConfig",
     "FillAttribution",
     "ForecastObservation",
     "ParameterCandidate",
@@ -56,6 +58,7 @@ __all__ = [
     "manifest_payload",
     "pnl_metrics",
     "reliability_curve",
+    "run_eval",
     "score_forecasts",
     "select_parameter",
     "sweep_train_test",

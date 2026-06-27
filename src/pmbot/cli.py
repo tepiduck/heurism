@@ -1,6 +1,8 @@
 """Command-line interface for pmbot."""
 
 import asyncio
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
@@ -8,6 +10,7 @@ import typer
 from rich.console import Console
 
 from pmbot.config import Settings
+from pmbot.eval.runner import EvalRunConfig, run_eval
 from pmbot.ingestion.runner import run_ingestion
 from pmbot.runner import (
     HARVEST_STATUS_RELATIVE_PATH,
@@ -247,3 +250,162 @@ def harvest_status_command(
             tracked_label="markets tracked",
         )
     )
+
+
+@app.command("eval")
+def eval_command(
+    data_dir: Annotated[
+        Path,
+        typer.Option(
+            "--data-dir",
+            file_okay=False,
+            help="Data directory containing raw book parquet and resolutions.",
+        ),
+    ] = Path("data"),
+    report: Annotated[
+        Path,
+        typer.Option(
+            "--report",
+            dir_okay=False,
+            help="Immutable output JSON manifest path.",
+        ),
+    ] = Path("out.json"),
+    allowlist: Annotated[
+        Path,
+        typer.Option(
+            "--allowlist",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Verified pair allowlist used to map raw books across venues.",
+        ),
+    ] = Path("pairs.draft.jsonl"),
+    start_ns: Annotated[
+        int | None,
+        typer.Option(
+            "--start-ns",
+            help="Optional inclusive ts_local_ns lower bound for raw book replay.",
+        ),
+    ] = None,
+    end_ns: Annotated[
+        int | None,
+        typer.Option(
+            "--end-ns",
+            help="Optional inclusive ts_local_ns upper bound for raw book replay.",
+        ),
+    ] = None,
+    bootstrap_samples: Annotated[
+        int,
+        typer.Option(
+            "--bootstrap-samples",
+            min=0,
+            help="Event-clustered bootstrap sample count for confidence intervals.",
+        ),
+    ] = 200,
+    calibration_bins: Annotated[
+        int,
+        typer.Option("--calibration-bins", min=1, help="Reliability curve bin count."),
+    ] = 10,
+    max_bid_ask_spread: Annotated[
+        str | None,
+        typer.Option(
+            "--max-bid-ask-spread",
+            help="Exclude low-confidence signal rows when either venue spread exceeds this.",
+        ),
+    ] = "0.10",
+    three_way_sum_tolerance: Annotated[
+        str | None,
+        typer.Option(
+            "--three-way-sum-tolerance",
+            help="Exclude match rows whose three legs do not sum to 1 within this tolerance.",
+        ),
+    ] = "0.05",
+    min_top_of_book_size: Annotated[
+        str | None,
+        typer.Option(
+            "--min-top-of-book-size",
+            help="Optional top-of-book size floor; rows below it are flagged/excluded.",
+        ),
+    ] = None,
+    knockout_start_date: Annotated[
+        str | None,
+        typer.Option(
+            "--knockout-start-date",
+            help="Optional YYYY-MM-DD cutoff for labeling knockout-stage games.",
+        ),
+    ] = "2026-07-01",
+    include_knockout: Annotated[
+        bool,
+        typer.Option(
+            "--include-knockout",
+            help="Score knockout-stage games instead of flagging/excluding them.",
+        ),
+    ] = False,
+    fit_regression: Annotated[
+        bool,
+        typer.Option(
+            "--fit-regression",
+            help="Opt in to overlap-regression fitting when enough resolved events exist.",
+        ),
+    ] = False,
+    min_distinct_events_for_regression: Annotated[
+        int,
+        typer.Option(
+            "--min-distinct-events-for-regression",
+            min=1,
+            help="Distinct resolved event floor before optional regression fitting can run.",
+        ),
+    ] = 30,
+    min_distinct_events_for_verdict: Annotated[
+        int,
+        typer.Option(
+            "--min-distinct-events-for-verdict",
+            min=1,
+            help="Distinct resolved event floor before a GO verdict is allowed.",
+        ),
+    ] = 30,
+    require_kalshi_leads: Annotated[
+        bool,
+        typer.Option(
+            "--require-kalshi-leads/--no-require-kalshi-leads",
+            help="Use the signal's Kalshi-leads freshness gate during raw replay.",
+        ),
+    ] = True,
+) -> None:
+    """Score recomputed cross-venue p_hat from raw recorded books."""
+    payload = run_eval(
+        EvalRunConfig(
+            data_dir=data_dir,
+            report_path=report,
+            allowlist_path=allowlist,
+            start_ns=start_ns,
+            end_ns=end_ns,
+            bootstrap_samples=bootstrap_samples,
+            calibration_bins=calibration_bins,
+            max_bid_ask_spread=_optional_decimal(max_bid_ask_spread),
+            three_way_sum_tolerance=_optional_decimal(three_way_sum_tolerance),
+            min_top_of_book_size=_optional_decimal(min_top_of_book_size),
+            knockout_start_date=_optional_date(knockout_start_date),
+            include_knockout=include_knockout,
+            fit_regression=fit_regression,
+            min_distinct_events_for_regression=min_distinct_events_for_regression,
+            min_distinct_events_for_verdict=min_distinct_events_for_verdict,
+            require_kalshi_leads=require_kalshi_leads,
+        )
+    )
+    console.print(
+        f"Wrote {report} | n={payload['n_observations']} | "
+        f"events={payload['distinct_event_count']} | {payload['headline']}"
+    )
+
+
+def _optional_decimal(value: str | None) -> Decimal | None:
+    if value is None or value.strip().casefold() in {"", "none", "off"}:
+        return None
+    return Decimal(value)
+
+
+def _optional_date(value: str | None) -> date | None:
+    if value is None or value.strip().casefold() in {"", "none", "off"}:
+        return None
+    return date.fromisoformat(value)
