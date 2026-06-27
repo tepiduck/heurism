@@ -22,6 +22,13 @@ def spread(book: BookSnapshot) -> Decimal | None:
     return book.best_ask.price - book.best_bid.price
 
 
+def midpoint(book: BookSnapshot) -> Decimal | None:
+    """Return top-of-book midpoint as a probability."""
+    if book.best_bid is None or book.best_ask is None:
+        return None
+    return (book.best_bid.price + book.best_ask.price) / Decimal("2")
+
+
 def depth(
     book: BookSnapshot,
     side: OrderSide | None = None,

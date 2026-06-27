@@ -348,8 +348,10 @@ async def _run_until_registry_change(
             return
         await task
     finally:
+        if not task.done():
+            task.cancel()
         change_task.cancel()
-        await asyncio.gather(change_task, return_exceptions=True)
+        await asyncio.gather(task, change_task, return_exceptions=True)
 
 
 def _url_or_default(value: object, default: str) -> str:

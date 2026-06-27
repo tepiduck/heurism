@@ -120,7 +120,7 @@ class CollectorStateStore:
     def save(self) -> None:
         """Persist status atomically."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._path.with_suffix(".tmp")
+        tmp_path = self._path.with_name(f"{self._path.name}.{time.time_ns()}.tmp")
         tmp_path.write_text(json.dumps(asdict(self._status), indent=2), encoding="utf-8")
         tmp_path.replace(self._path)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable
 from pathlib import Path
 
 from pmbot.backtest.book import OrderBookState
@@ -52,22 +53,30 @@ class SignalEventObserver:
 
     def observe(self, event: NormalizedEvent) -> None:
         """Observe one normalized event and log any computable signals."""
-        if isinstance(event, GapEvent):
-            self._apply_gap(event)
-        elif isinstance(event, BookEvent):
-            self._book.apply(event)
-            if event.event_type == BookEventType.SNAPSHOT:
-                self._gap_assets.discard(event.asset_id)
-                self._gap_conditions.discard(event.condition_id)
-            self._note_frame(event.asset_id, event.ts_local_ns)
-        elif isinstance(event, TradeEvent):
-            self._trades.append(event)
-            self._note_frame(event.asset_id, event.ts_local_ns)
-        else:
-            return
-        self._events.append(event)
-        if isinstance(event, (BookEvent, TradeEvent)):
-            self._log_signals(event.ts_local_ns)
+        self.observe_many((event,))
+
+    def observe_many(self, events: Iterable[NormalizedEvent]) -> None:
+        """Observe a parsed frame and log after the full batch is applied."""
+        latest_signal_ts: int | None = None
+        for event in events:
+            if isinstance(event, GapEvent):
+                self._apply_gap(event)
+            elif isinstance(event, BookEvent):
+                self._book.apply(event)
+                if event.event_type == BookEventType.SNAPSHOT:
+                    self._gap_assets.discard(event.asset_id)
+                    self._gap_conditions.discard(event.condition_id)
+                self._note_frame(event.asset_id, event.ts_local_ns)
+                latest_signal_ts = event.ts_local_ns
+            elif isinstance(event, TradeEvent):
+                self._trades.append(event)
+                self._note_frame(event.asset_id, event.ts_local_ns)
+                latest_signal_ts = event.ts_local_ns
+            else:
+                continue
+            self._events.append(event)
+        if latest_signal_ts is not None:
+            self._log_signals(latest_signal_ts)
 
     def flush(self) -> None:
         """Flush signal writer buffers."""
@@ -135,6 +144,13 @@ class SignalLoggingRecorder(ParquetRecorder):
         """Record and observe one normalized event."""
         super().record(event)
         self._observer.observe(event)
+
+    def record_many(self, events: Iterable[NormalizedEvent]) -> None:
+        """Record and observe many normalized events as one atomic frame."""
+        event_tuple = tuple(events)
+        for event in event_tuple:
+            ParquetRecorder.record(self, event)
+        self._observer.observe_many(event_tuple)
 
     def flush_all(self) -> None:
         """Flush market-data and signal buffers."""

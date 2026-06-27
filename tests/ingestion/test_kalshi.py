@@ -9,6 +9,8 @@ import polars as pl
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from pmbot.backtest.book import OrderBookState
+from pmbot.features.orderbook import midpoint
 from pmbot.ingestion.kalshi import (
     KALSHI_WS_PATH,
     KALSHI_WS_URL,
@@ -418,6 +420,38 @@ def test_real_kalshi_orderbook_frame_fixture_validation() -> None:
         )
     ]
     assert expected_absolute_size == Decimal("192456.86")
+
+
+def test_real_kalshi_three_way_match_probabilities_are_sane() -> None:
+    probabilities: dict[str, Decimal] = {}
+
+    for leg in ("cod", "uzb", "tie"):
+        payload = json.loads(
+            (FIXTURE_DIR / f"kalshi_orderbook_snapshot_coduzb_{leg}.json").read_text()
+        )
+        ticker = payload["msg"]["market_ticker"]
+        normalizer = KalshiNormalizer()
+        state = OrderBookState()
+        for event in normalizer.parse_payload(payload, ts_local_ns=1_782_550_000_000_000_000):
+            if isinstance(event, BookEvent):
+                state.apply(event)
+
+        book = state.snapshot(ticker)
+        probability = midpoint(book)
+
+        assert probability is not None
+        assert book.best_bid is not None
+        assert book.best_ask is not None
+        assert book.best_bid.price <= probability <= book.best_ask.price
+        assert probability < Decimal("0.90")
+        probabilities[leg] = probability
+
+    assert probabilities == {
+        "cod": Decimal("0.5850"),
+        "uzb": Decimal("0.1750"),
+        "tie": Decimal("0.2350"),
+    }
+    assert abs(sum(probabilities.values(), Decimal("0")) - Decimal("1")) <= Decimal("0.01")
 
 
 def test_kalshi_metadata_client_normalizes_open_markets_from_rest() -> None:

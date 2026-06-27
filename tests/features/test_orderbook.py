@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from pmbot.backtest.models import BookLevel, BookSnapshot, OrderSide
-from pmbot.features import BookSizeUnit, depth, microprice, order_book_imbalance, spread
+from pmbot.features import BookSizeUnit, depth, microprice, midpoint, order_book_imbalance, spread
 
 
 def test_orderbook_feature_math_matches_hand_computed_values() -> None:
@@ -15,6 +15,7 @@ def test_orderbook_feature_math_matches_hand_computed_values() -> None:
     assert depth(book, OrderSide.BUY) == Decimal("10")
     assert depth(book, OrderSide.SELL) == Decimal("30")
     assert order_book_imbalance(book) == Decimal("-0.5")
+    assert midpoint(book) == Decimal("0.50")
     assert microprice(book) == Decimal("0.45")
 
 

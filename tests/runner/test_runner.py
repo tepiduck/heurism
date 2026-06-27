@@ -19,7 +19,7 @@ from pmbot.runner.collector import _record_startup_resolutions
 from pmbot.runner.models import CollectorStatus, ResolutionRecord, VenueStatus
 from pmbot.runner.orchestrator import CollectorOrchestrator
 from pmbot.runner.resolutions import ResolutionPoller, StaticResolutionSource
-from pmbot.runner.signal_logging import SignalEventObserver
+from pmbot.runner.signal_logging import SignalEventObserver, SignalLoggingRecorder
 from pmbot.runner.state import STATUS_RELATIVE_PATH, CollectorStateStore, load_status, render_status
 from pmbot.runner.streams import ResolutionParquetStore, SignalParquetWriter
 from pmbot.signals.contracts import VerifiedContractPair
@@ -87,6 +87,39 @@ def test_signal_logging_writes_expected_parquet_schema(tmp_path) -> None:
     ]
     assert frame["direction"].to_list() == ["buy"]
     assert frame["p_hat"].to_list()[0] > Decimal("0.60")
+
+
+def test_signal_logging_records_snapshot_batch_atomically(tmp_path) -> None:
+    writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=100, flush_interval_seconds=999)
+    observer = SignalEventObserver(pairs=(PAIR,), signal_writer=writer)
+    recorder = SignalLoggingRecorder(
+        data_dir=tmp_path,
+        observer=observer,
+        buffer_size=100,
+        flush_interval_seconds=999,
+    )
+    recorder.record_many(
+        (
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.BID, "0.59", "10"),
+            book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.ASK, "0.61", "10"),
+        )
+    )
+
+    recorder.record_many(
+        (
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.BID, "0.60", "100"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.98", "100"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.97", "100"),
+            book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.61", "100"),
+        )
+    )
+    recorder.flush_all()
+
+    files = list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
+    frame = pl.read_parquet(files)
+
+    assert len(frame) == 1
+    assert frame["kalshi_probability"].to_list() == [Decimal("0.6050000000")]
 
 
 def test_signal_logging_keeps_bounded_recent_history(tmp_path) -> None:
