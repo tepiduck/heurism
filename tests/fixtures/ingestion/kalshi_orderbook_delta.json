@@ -1,0 +1,2 @@
+{"type":"orderbook_delta","sid":1,"seq":2,"msg":{"market_ticker":"KXWCGAME-26JUN27CODUZB-COD","market_id":"7c61fe70-c821-434c-9276-f4fa8b653d3a","price_dollars":"0.5900","delta_fp":"-7000.00","side":"yes","ts":"2026-06-27T06:55:11.728741Z","ts_ms":1782543311728}}
+

@@ -1,10 +1,11 @@
 import asyncio
+import json
 from base64 import b64decode
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import polars as pl
-import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -30,6 +31,8 @@ from pmbot.ingestion.schemas import (
     GapReason,
     TradeEvent,
 )
+
+FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "ingestion"
 
 
 def test_kalshi_orderbook_snapshot_normalizes_yes_bids_and_implied_yes_asks() -> None:
@@ -345,11 +348,76 @@ def test_kalshi_metadata_client_adds_auth_headers() -> None:
     asyncio.run(run())
 
 
-@pytest.mark.xfail(
-    reason="TODO: capture real Kalshi orderbook_snapshot/orderbook_delta frames off-network",
-)
-def test_real_kalshi_frame_fixture_pending() -> None:
-    raise AssertionError("real Kalshi frame fixture pending")
+def test_real_kalshi_orderbook_frame_fixture_validation() -> None:
+    snapshot = json.loads((FIXTURE_DIR / "kalshi_orderbook_snapshot.json").read_text())
+    delta = json.loads((FIXTURE_DIR / "kalshi_orderbook_delta.json").read_text())
+
+    normalizer = KalshiNormalizer()
+    snapshot_events = normalizer.parse_payload(
+        snapshot,
+        ts_local_ns=1_782_543_311_728_000_000,
+        ts_monotonic_ns=1,
+    )
+    snapshot_gaps = [event for event in snapshot_events if isinstance(event, GapEvent)]
+    snapshot_books = [event for event in snapshot_events if isinstance(event, BookEvent)]
+
+    assert snapshot["msg"]["market_ticker"] == "KXWCGAME-26JUN27CODUZB-COD"
+    assert len(snapshot_gaps) == 1
+    assert snapshot_gaps[0].reason == GapReason.RECONNECT
+    assert len(snapshot_books) == 84
+    assert snapshot_books[0] == BookEvent(
+        ts_local_ns=1_782_543_311_728_000_000,
+        ts_monotonic_ns=1,
+        ts_exchange=None,
+        condition_id="KXWCGAME-26JUN27CODUZB-COD",
+        asset_id="KXWCGAME-26JUN27CODUZB-COD",
+        event_type=BookEventType.SNAPSHOT,
+        side=BookSide.BID,
+        price=Decimal("0.0100"),
+        size=Decimal("1644502.42"),
+        seq_or_hash="7c61fe70-c821-434c-9276-f4fa8b653d3a",
+    )
+    first_ask = next(event for event in snapshot_books if event.side == BookSide.ASK)
+    assert first_ask.price == Decimal("0.9900")
+    assert first_ask.size == Decimal("1210816.01")
+
+    delta_msg = delta["msg"]
+    side = delta_msg["side"]
+    raw_price = Decimal(delta_msg["price_dollars"])
+    raw_delta = Decimal(delta_msg["delta_fp"])
+    raw_levels = snapshot["msg"]["yes_dollars_fp" if side == "yes" else "no_dollars_fp"]
+    prior_size = next(
+        Decimal(raw_size)
+        for raw_level_price, raw_size in raw_levels
+        if Decimal(raw_level_price) == raw_price
+    )
+    expected_absolute_size = max(Decimal("0"), prior_size + raw_delta)
+
+    delta_events = normalizer.parse_payload(
+        delta,
+        ts_local_ns=1_782_543_311_729_000_000,
+        ts_monotonic_ns=2,
+    )
+    delta_gaps = [event for event in delta_events if isinstance(event, GapEvent)]
+    delta_books = [event for event in delta_events if isinstance(event, BookEvent)]
+
+    assert delta["seq"] == snapshot["seq"] + 1
+    assert delta_gaps == []
+    assert delta_books == [
+        BookEvent(
+            ts_local_ns=1_782_543_311_729_000_000,
+            ts_monotonic_ns=2,
+            ts_exchange="1782543311728",
+            condition_id="KXWCGAME-26JUN27CODUZB-COD",
+            asset_id="KXWCGAME-26JUN27CODUZB-COD",
+            event_type=BookEventType.DELTA,
+            side=BookSide.BID,
+            price=Decimal("0.5900"),
+            size=expected_absolute_size,
+            seq_or_hash="2",
+        )
+    ]
+    assert expected_absolute_size == Decimal("192456.86")
 
 
 def test_kalshi_metadata_client_normalizes_open_markets_from_rest() -> None:
