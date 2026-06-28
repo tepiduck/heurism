@@ -50,6 +50,14 @@ class OrderBookState:
         )
         return BookSnapshot(asset_id=asset_id, bids=bids, asks=asks)
 
+    def clone(self) -> OrderBookState:
+        """Return a mutable copy for off-loop read-only computations."""
+        clone = OrderBookState()
+        clone._bids = {asset_id: dict(levels) for asset_id, levels in self._bids.items()}
+        clone._asks = {asset_id: dict(levels) for asset_id, levels in self._asks.items()}
+        clone._snapshot_keys = dict(self._snapshot_keys)
+        return clone
+
     def queue_ahead(
         self,
         order: OrderRequest,

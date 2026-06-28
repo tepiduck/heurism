@@ -287,6 +287,11 @@ class StatusTrackingRecorder(ParquetRecorder):
         for event in event_tuple:
             self._observe(event)
 
+    def flush_all(self) -> None:
+        """Flush raw buffers and force the latest harvest status to disk."""
+        super().flush_all()
+        self._state.save()
+
     def _observe(self, event: NormalizedEvent) -> None:
         if isinstance(event, (BookEvent, TradeEvent)):
             self._state.note_frame(

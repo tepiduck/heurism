@@ -15,6 +15,7 @@ STATUS_RELATIVE_PATH = Path("collector") / "status.json"
 HARVEST_STATUS_RELATIVE_PATH = Path("harvest") / "status.json"
 ONE_HOUR_NS = 3_600_000_000_000
 ONE_DAY_NS = 86_400_000_000_000
+STATUS_SAVE_INTERVAL_NS = 1_000_000_000
 
 
 class CollectorStateStore:
@@ -27,8 +28,11 @@ class CollectorStateStore:
         pairs_tracked: int,
         status_path: Path | None = None,
         relative_path: Path = STATUS_RELATIVE_PATH,
+        save_interval_ns: int = STATUS_SAVE_INTERVAL_NS,
     ) -> None:
         self._path = status_path or data_dir / relative_path
+        self._save_interval_ns = max(0, save_interval_ns)
+        self._last_save_ns: int | None = None
         process_started_at_ns = time.time_ns()
         loaded = self._load()
         self._status = loaded or CollectorStatus(
@@ -67,6 +71,7 @@ class CollectorStateStore:
                 reconnects=item.reconnects,
                 gap_timestamps_ns=item.gap_timestamps_ns,
             ),
+            force_save=False,
         )
 
     def note_reconnect(self, venue: str) -> None:
@@ -80,6 +85,7 @@ class CollectorStateStore:
                 reconnects=item.reconnects + 1,
                 gap_timestamps_ns=item.gap_timestamps_ns,
             ),
+            force_save=True,
         )
 
     def note_gap(self, venue: str, *, ts_local_ns: int | None = None) -> None:
@@ -99,6 +105,7 @@ class CollectorStateStore:
                     if timestamp >= cutoff
                 ),
             ),
+            force_save=False,
         )
 
     def note_resolutions(self, count: int) -> None:
@@ -129,12 +136,27 @@ class CollectorStateStore:
 
     def save(self) -> None:
         """Persist status atomically."""
+        now = time.time_ns()
+        self._write_status(now)
+        self._last_save_ns = now
+
+    def _save_if_due(self, now_ns: int) -> None:
+        if (
+            self._last_save_ns is None
+            or self._save_interval_ns == 0
+            or now_ns - self._last_save_ns >= self._save_interval_ns
+        ):
+            self._write_status(now_ns)
+            self._last_save_ns = now_ns
+
+    def _write_status(self, now_ns: int) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._path.with_name(f"{self._path.name}.{time.time_ns()}.tmp")
+        tmp_path = self._path.with_name(f"{self._path.name}.{now_ns}.tmp")
         tmp_path.write_text(json.dumps(asdict(self._status), indent=2), encoding="utf-8")
         tmp_path.replace(self._path)
 
-    def _update_venue(self, venue: str, update: Any) -> None:
+    def _update_venue(self, venue: str, update: Any, *, force_save: bool) -> None:
+        now = time.time_ns()
         venues = list(self._status.venues)
         for index, item in enumerate(venues):
             if item.venue == venue:
@@ -144,12 +166,16 @@ class CollectorStateStore:
             venues.append(update(VenueStatus(venue, None, 0, 0, ())))
         self._status = CollectorStatus(
             started_at_ns=self._status.started_at_ns,
-            updated_at_ns=time.time_ns(),
+            updated_at_ns=now,
             pairs_tracked=self._status.pairs_tracked,
             resolutions_collected=self._status.resolutions_collected,
             venues=tuple(venues),
         )
-        self.save()
+        if force_save:
+            self._write_status(now)
+            self._last_save_ns = now
+        else:
+            self._save_if_due(now)
 
     def _load(self) -> CollectorStatus | None:
         return _load_status_path(self._path)

@@ -44,7 +44,11 @@ from pmbot.runner.resolutions import (
     ResolutionPoller,
     ResolutionSource,
 )
-from pmbot.runner.signal_logging import SignalEventObserver, SignalLoggingRecorder
+from pmbot.runner.signal_logging import (
+    SignalComputationTask,
+    SignalEventObserver,
+    SignalLoggingRecorder,
+)
 from pmbot.runner.state import CollectorStateStore
 from pmbot.runner.streams import ResolutionParquetStore, SignalParquetWriter
 from pmbot.runner.world_cup_discovery import (
@@ -163,6 +167,10 @@ async def run_collector(
             WorldCupDiscoveryRefreshTask(
                 refresher=refresher,
                 interval_seconds=discovery_interval_seconds,
+            ),
+            SignalComputationTask(
+                observer=observer,
+                interval_seconds=settings.SIGNAL_COMPUTE_INTERVAL_SECONDS,
             ),
             RawDataCompactionTask(
                 data_dir=data_dir,

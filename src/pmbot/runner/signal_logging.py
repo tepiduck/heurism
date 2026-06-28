@@ -2,25 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 from pmbot.backtest.book import OrderBookState
-from pmbot.backtest.engine import PointInTimeView
-from pmbot.backtest.models import BookSnapshot
+from pmbot.backtest.engine import PointInTimeView, QuoteClock
 from pmbot.ingestion.recorder import ParquetRecorder
-from pmbot.ingestion.schemas import BookEvent, BookEventType, GapEvent, NormalizedEvent, TradeEvent
+from pmbot.ingestion.schemas import (
+    BookEvent,
+    BookEventType,
+    BookSide,
+    GapEvent,
+    NormalizedEvent,
+    TradeEvent,
+)
 from pmbot.runner.state import CollectorStateStore
 from pmbot.runner.streams import SignalParquetWriter
 from pmbot.signals.contracts import VerifiedContractPair
 from pmbot.signals.cross_venue import CrossVenueSignal, SignalValue
 
 DEFAULT_SIGNAL_MIN_INTERVAL_NS = 250_000_000
+DEFAULT_SIGNAL_COMPUTE_INTERVAL_SECONDS = 1.0
 DEFAULT_RAW_RECORDER_BUFFER_SIZE = 10_000
 _PairKey = tuple[str, str, str]
-_BookFingerprint = tuple[tuple[str, Decimal, Decimal], ...]
 _SignalFingerprint = tuple[
     Decimal,
     Decimal,
@@ -35,7 +44,7 @@ _SignalFingerprint = tuple[
 
 
 class SignalEventObserver:
-    """Maintain point-in-time state and persist signals on each market update."""
+    """Maintain point-in-time state for periodic signal computation."""
 
     def __init__(
         self,
@@ -58,10 +67,12 @@ class SignalEventObserver:
         self._trades: deque[TradeEvent] = deque(maxlen=max_history_trades)
         self._gap_assets: set[str] = set()
         self._gap_conditions: set[str] = set()
+        self._quote_clocks: dict[str, QuoteClock] = {}
         self._venue_by_asset = _venue_map(pairs)
         self._signals_by_pair = _signal_map(pairs)
         self._pair_keys_by_identifier = _pair_identifier_map(pairs)
-        self._book_fingerprints: dict[str, _BookFingerprint] = {}
+        self._dirty_pair_keys: set[_PairKey] = set()
+        self._latest_book_ts_ns: int | None = None
         self._last_signal_fingerprints: dict[_PairKey, _SignalFingerprint] = {}
         self._last_signal_write_ns: dict[_PairKey, int] = {}
 
@@ -80,34 +91,55 @@ class SignalEventObserver:
         self.observe_many((event,))
 
     def observe_many(self, events: Iterable[NormalizedEvent]) -> None:
-        """Observe a parsed frame and log after the full batch is applied."""
-        latest_signal_ts: int | None = None
-        touched_book_assets: set[str] = set()
+        """Observe a parsed frame with only cheap per-event bookkeeping."""
         for event in events:
             if isinstance(event, GapEvent):
                 self._apply_gap(event)
             elif isinstance(event, BookEvent):
                 self._book.apply(event)
+                self._apply_quote_clock(event)
                 if event.event_type == BookEventType.SNAPSHOT:
                     self._gap_assets.discard(event.asset_id)
                     self._gap_conditions.discard(event.condition_id)
                 self._note_frame(event.asset_id, event.ts_local_ns)
-                latest_signal_ts = event.ts_local_ns
-                touched_book_assets.add(event.asset_id)
+                self._latest_book_ts_ns = event.ts_local_ns
+                self._dirty_pair_keys.update(self._pair_keys_by_identifier.get(event.asset_id, ()))
             elif isinstance(event, TradeEvent):
                 self._trades.append(event)
                 self._note_frame(event.asset_id, event.ts_local_ns)
-                latest_signal_ts = event.ts_local_ns
             else:
                 continue
             self._events.append(event)
-        changed_pair_keys = self._changed_pair_keys(touched_book_assets)
-        if latest_signal_ts is not None and changed_pair_keys:
-            self._log_signals(latest_signal_ts, changed_pair_keys)
 
     def flush(self) -> None:
         """Flush signal writer buffers."""
         self._signal_writer.flush_all()
+        if self._state is not None:
+            self._state.save()
+
+    def compute_pending_signals(self) -> int:
+        """Compute dirty pair signals synchronously, mainly for tests/tools."""
+        job = self._snapshot_signal_job()
+        if job is None:
+            return 0
+        try:
+            values = job.compute()
+        except Exception:
+            self._dirty_pair_keys.update(job.pair_keys)
+            raise
+        return self._record_computed_signals(job.pair_keys, values)
+
+    async def compute_pending_signals_async(self) -> int:
+        """Snapshot state and compute dirty pair signals in a worker thread."""
+        job = self._snapshot_signal_job()
+        if job is None:
+            return 0
+        try:
+            values = await asyncio.to_thread(job.compute)
+        except Exception:
+            self._dirty_pair_keys.update(job.pair_keys)
+            raise
+        return self._record_computed_signals(job.pair_keys, values)
 
     def set_pairs(self, pairs: tuple[VerifiedContractPair, ...]) -> None:
         """Replace the signal and venue-attribution pair set."""
@@ -115,6 +147,7 @@ class SignalEventObserver:
         self._venue_by_asset = _venue_map(pairs)
         self._signals_by_pair = _signal_map(pairs)
         self._pair_keys_by_identifier = _pair_identifier_map(pairs)
+        self._dirty_pair_keys.update(self._signals_by_pair)
         active_keys = set(self._signals_by_pair)
         self._last_signal_fingerprints = {
             key: value
@@ -138,33 +171,51 @@ class SignalEventObserver:
             return
         self._gap_assets.add(event.asset_id)
 
-    def _changed_pair_keys(self, touched_book_assets: set[str]) -> set[_PairKey]:
-        changed_pair_keys: set[_PairKey] = set()
-        for asset_id in touched_book_assets:
-            fingerprint = _book_fingerprint(self._book.snapshot(asset_id))
-            if self._book_fingerprints.get(asset_id) == fingerprint:
-                continue
-            self._book_fingerprints[asset_id] = fingerprint
-            changed_pair_keys.update(self._pair_keys_by_identifier.get(asset_id, ()))
-        return changed_pair_keys
-
-    def _log_signals(self, ts_local_ns: int, pair_keys: Iterable[_PairKey]) -> None:
+    def _snapshot_signal_job(self) -> _SignalComputeJob | None:
+        if self._latest_book_ts_ns is None or not self._dirty_pair_keys:
+            return None
+        pair_keys = frozenset(
+            key for key in self._dirty_pair_keys if key in self._signals_by_pair
+        )
+        if not pair_keys:
+            self._dirty_pair_keys.clear()
+            return None
+        self._dirty_pair_keys.difference_update(pair_keys)
         view = PointInTimeView(
-            ts_local_ns=ts_local_ns,
-            _book=self._book,
+            ts_local_ns=self._latest_book_ts_ns,
+            _book=self._book.clone(),
             _trades=tuple(self._trades),
             _events=tuple(self._events),
             _gap_active_assets=frozenset(self._gap_assets),
             _gap_active_all=bool(self._gap_conditions),
-            _quote_clocks={},
+            _quote_clocks=dict(self._quote_clocks),
         )
-        for pair_key in sorted(pair_keys):
-            signal = self._signals_by_pair.get(pair_key)
-            if signal is None:
+        return _SignalComputeJob(
+            pair_keys=pair_keys,
+            signals_by_pair={
+                pair_key: self._signals_by_pair[pair_key] for pair_key in pair_keys
+            },
+            view=view,
+        )
+
+    def _record_computed_signals(
+        self,
+        pair_keys: frozenset[_PairKey],
+        values: Iterable[SignalValue],
+    ) -> int:
+        recorded = 0
+        for value in values:
+            pair_key = (
+                value.polymarket_condition_id,
+                value.polymarket_asset_id,
+                value.kalshi_ticker,
+            )
+            if pair_key not in pair_keys:
                 continue
-            for value in signal.compute(view):
-                if self._should_record_signal(pair_key, value):
-                    self._signal_writer.record_value(value)
+            if self._should_record_signal(pair_key, value):
+                self._signal_writer.record_value(value)
+                recorded += 1
+        return recorded
 
     def _should_record_signal(self, pair_key: _PairKey, value: SignalValue) -> bool:
         fingerprint = _signal_fingerprint(value)
@@ -189,6 +240,62 @@ class SignalEventObserver:
             _venue_for_identifier(asset_id, self._venue_by_asset),
             ts_local_ns=ts_local_ns,
         )
+
+    def _apply_quote_clock(self, event: BookEvent) -> None:
+        ts_exchange_ns = _parse_exchange_time_ns(event.ts_exchange)
+        if ts_exchange_ns is None:
+            return
+        current = self._quote_clocks.get(event.asset_id, QuoteClock(None, None))
+        if event.side == BookSide.BID:
+            bid_ns = (
+                ts_exchange_ns
+                if current.bid_ns is None
+                else max(current.bid_ns, ts_exchange_ns)
+            )
+            self._quote_clocks[event.asset_id] = QuoteClock(bid_ns, current.ask_ns)
+        elif event.side == BookSide.ASK:
+            ask_ns = (
+                ts_exchange_ns
+                if current.ask_ns is None
+                else max(current.ask_ns, ts_exchange_ns)
+            )
+            self._quote_clocks[event.asset_id] = QuoteClock(current.bid_ns, ask_ns)
+
+
+@dataclass(frozen=True, slots=True)
+class _SignalComputeJob:
+    pair_keys: frozenset[_PairKey]
+    signals_by_pair: dict[_PairKey, CrossVenueSignal]
+    view: PointInTimeView
+
+    def compute(self) -> tuple[SignalValue, ...]:
+        values: list[SignalValue] = []
+        for pair_key in sorted(self.pair_keys):
+            signal = self.signals_by_pair.get(pair_key)
+            if signal is not None:
+                values.extend(signal.compute(self.view))
+        return tuple(values)
+
+
+class SignalComputationTask:
+    """Periodically compute live signals away from ingestion callbacks."""
+
+    name = "signal_computation"
+
+    def __init__(
+        self,
+        *,
+        observer: SignalEventObserver,
+        interval_seconds: float = DEFAULT_SIGNAL_COMPUTE_INTERVAL_SECONDS,
+    ) -> None:
+        self._observer = observer
+        self._interval_seconds = max(0.001, interval_seconds)
+
+    async def run(self) -> None:
+        """Compute dirty signals forever on a fixed cadence."""
+        while True:
+            await asyncio.sleep(self._interval_seconds)
+            await self._observer.compute_pending_signals_async()
 
 
 class SignalLoggingRecorder(ParquetRecorder):
@@ -259,13 +366,6 @@ def _pair_identifier_map(pairs: tuple[VerifiedContractPair, ...]) -> dict[str, s
     return pairs_by_identifier
 
 
-def _book_fingerprint(book: BookSnapshot) -> _BookFingerprint:
-    return (
-        *(("bid", level.price, level.size) for level in book.bids),
-        *(("ask", level.price, level.size) for level in book.asks),
-    )
-
-
 def _signal_fingerprint(value: SignalValue) -> _SignalFingerprint:
     return (
         value.polymarket_probability,
@@ -317,3 +417,24 @@ def _infer_venue(identifier: str) -> str:
     if text.upper().startswith("KX"):
         return "kalshi"
     return "unknown"
+
+
+def _parse_exchange_time_ns(value: str | None) -> int | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        pass
+    iso_value = stripped.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    parsed_utc = parsed.astimezone(UTC)
+    return int(parsed_utc.timestamp()) * 1_000_000_000 + parsed_utc.microsecond * 1_000

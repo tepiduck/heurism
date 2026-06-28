@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from decimal import Decimal
 
 import polars as pl
@@ -25,6 +26,7 @@ from pmbot.runner.signal_logging import SignalEventObserver, SignalLoggingRecord
 from pmbot.runner.state import STATUS_RELATIVE_PATH, CollectorStateStore, load_status, render_status
 from pmbot.runner.streams import ResolutionParquetStore, SignalParquetWriter
 from pmbot.signals.contracts import VerifiedContractPair
+from pmbot.signals.cross_venue import CrossVenueSignal
 
 BASE_TS = 1_800_000_000_000_000_000
 PAIR = VerifiedContractPair(
@@ -68,6 +70,7 @@ def test_signal_logging_writes_expected_parquet_schema(tmp_path) -> None:
         book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
     ):
         observer.observe(event)
+    observer.compute_pending_signals()
     observer.flush()
 
     files = list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
@@ -115,6 +118,7 @@ def test_signal_logging_records_snapshot_batch_atomically(tmp_path) -> None:
             book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.61", "100"),
         )
     )
+    observer.compute_pending_signals()
     recorder.flush_all()
 
     files = list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
@@ -150,6 +154,7 @@ def test_signal_logging_depth_cap_does_not_change_midpoint(tmp_path) -> None:
             book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.61", "100"),
         )
     )
+    observer.compute_pending_signals()
     recorder.flush_all()
 
     signal_frame = pl.read_parquet(
@@ -194,6 +199,7 @@ def test_signal_logging_static_prices_write_one_signal_row(tmp_path) -> None:
             book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
         )
     )
+    observer.compute_pending_signals()
 
     for index in range(20):
         recorder.record_many(
@@ -202,6 +208,7 @@ def test_signal_logging_static_prices_write_one_signal_row(tmp_path) -> None:
                 book_event(BASE_TS + 2 + index, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
             )
         )
+        observer.compute_pending_signals()
     recorder.flush_all()
 
     files = list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
@@ -236,12 +243,14 @@ def test_signal_logging_preserves_changed_signal_inside_throttle_window(tmp_path
             book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
         )
     )
+    observer.compute_pending_signals()
     recorder.record_many(
         (
             book_event(BASE_TS + 2, "KXTEST", "KXTEST", BookSide.BID, "0.70", "10"),
             book_event(BASE_TS + 2, "KXTEST", "KXTEST", BookSide.ASK, "0.72", "10"),
         )
     )
+    observer.compute_pending_signals()
     recorder.flush_all()
 
     files = list(tmp_path.glob("signals/date=*/market=pm-condition/*.parquet"))
@@ -251,6 +260,104 @@ def test_signal_logging_preserves_changed_signal_inside_throttle_window(tmp_path
         Decimal("0.7000000000"),
         Decimal("0.7100000000"),
     ]
+
+
+def test_high_frame_throughput_does_not_compute_signals_per_event(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=10_000)
+        observer = SignalEventObserver(pairs=(PAIR,), signal_writer=writer)
+        recorder = SignalLoggingRecorder(
+            data_dir=tmp_path,
+            observer=observer,
+            buffer_size=1_000_000,
+            flush_interval_seconds=999,
+        )
+
+        def forbidden_compute(
+            self: CrossVenueSignal,
+            view: object,
+        ) -> tuple[object, ...]:
+            del self, view
+            raise AssertionError("signal compute ran on the ingestion path")
+
+        monkeypatch.setattr(CrossVenueSignal, "compute", forbidden_compute)
+        keepalive_ticks = 0
+        keepalive_running = True
+
+        async def keepalive() -> None:
+            nonlocal keepalive_ticks
+            while keepalive_running:
+                await asyncio.sleep(0)
+                keepalive_ticks += 1
+
+        keepalive_task = asyncio.create_task(keepalive())
+        for index in range(3_000):
+            ts = BASE_TS + index
+            recorder.record_many(
+                (
+                    book_event(ts, "pm-condition", "pm-yes", BookSide.BID, "0.49", "10"),
+                    book_event(ts, "pm-condition", "pm-yes", BookSide.ASK, "0.51", "10"),
+                    book_event(ts, "KXTEST", "KXTEST", BookSide.BID, "0.69", "10"),
+                    book_event(ts, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
+                )
+            )
+            if index % 25 == 0:
+                await asyncio.sleep(0)
+        keepalive_running = False
+        await keepalive_task
+
+        assert keepalive_ticks > 10
+
+    asyncio.run(run())
+
+
+def test_async_signal_compute_does_not_starve_keepalive(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=100, flush_interval_seconds=999)
+        observer = SignalEventObserver(pairs=(PAIR,), signal_writer=writer)
+        recorder = SignalLoggingRecorder(
+            data_dir=tmp_path,
+            observer=observer,
+            buffer_size=100,
+            flush_interval_seconds=999,
+        )
+        original_compute = CrossVenueSignal.compute
+
+        def slow_compute(self: CrossVenueSignal, view):
+            time.sleep(0.03)
+            return original_compute(self, view)
+
+        monkeypatch.setattr(CrossVenueSignal, "compute", slow_compute)
+        recorder.record_many(
+            (
+                book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.BID, "0.49", "10"),
+                book_event(BASE_TS, "pm-condition", "pm-yes", BookSide.ASK, "0.51", "10"),
+                book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.BID, "0.69", "10"),
+                book_event(BASE_TS + 1, "KXTEST", "KXTEST", BookSide.ASK, "0.71", "10"),
+            )
+        )
+        keepalive_ticks = 0
+        keepalive_running = True
+
+        async def keepalive() -> None:
+            nonlocal keepalive_ticks
+            while keepalive_running:
+                await asyncio.sleep(0.001)
+                keepalive_ticks += 1
+
+        keepalive_task = asyncio.create_task(keepalive())
+        recorded = await observer.compute_pending_signals_async()
+        keepalive_running = False
+        await keepalive_task
+        observer.flush()
+
+        assert recorded == 1
+        assert keepalive_ticks >= 2
+
+    asyncio.run(run())
 
 
 def test_signal_logging_keeps_bounded_recent_history(tmp_path) -> None:
