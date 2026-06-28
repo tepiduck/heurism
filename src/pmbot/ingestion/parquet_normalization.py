@@ -56,5 +56,5 @@ def _decimal_bounds(precision: int, scale: int) -> tuple[Decimal, Decimal]:
     integer_digits = precision - scale
     integral = "9" * integer_digits if integer_digits > 0 else "0"
     fractional = "9" * scale
-    maximum = Decimal(f"{integral}.{fractional}" if scale else integral)
-    return -maximum, maximum
+    maximum_text = f"{integral}.{fractional}" if scale else integral
+    return Decimal(f"-{maximum_text}"), Decimal(maximum_text)
