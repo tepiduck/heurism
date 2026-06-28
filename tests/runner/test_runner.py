@@ -18,9 +18,14 @@ from pmbot.ingestion.schemas import (
     TradeEvent,
 )
 from pmbot.runner.allowlist import load_verified_pairs
-from pmbot.runner.collector import _record_startup_resolutions, _tracked_polymarket_metadata
+from pmbot.runner.collector import (
+    _drop_resolved_live_pairs,
+    _record_startup_resolutions,
+    _tracked_polymarket_metadata,
+)
 from pmbot.runner.models import CollectorStatus, ResolutionRecord, VenueStatus
 from pmbot.runner.orchestrator import CollectorOrchestrator
+from pmbot.runner.pairs import CollectedPairStore, PairRegistry
 from pmbot.runner.resolutions import ResolutionPoller, StaticResolutionSource
 from pmbot.runner.signal_logging import SignalEventObserver, SignalLoggingRecorder
 from pmbot.runner.state import STATUS_RELATIVE_PATH, CollectorStateStore, load_status, render_status
@@ -56,6 +61,24 @@ def test_orchestrator_restarts_failed_venue_without_stopping_other(tmp_path, cap
         assert "RuntimeError: boom" in caplog.text
 
     caplog.set_level(logging.WARNING, logger="pmbot.runner.orchestrator")
+    asyncio.run(run())
+
+
+def test_orchestrator_preserves_backoff_for_fast_exiting_venue(tmp_path) -> None:
+    async def run() -> None:
+        state = CollectorStateStore(data_dir=tmp_path, pairs_tracked=1)
+        fast = FastExitTask()
+        orchestrator = CollectorOrchestrator(
+            venue_tasks=(fast,),
+            state=state,
+            backoff=BackoffPolicy(initial_seconds=0.02, max_seconds=0.02, jitter_seconds=0),
+            min_successful_uptime_seconds=30.0,
+        )
+
+        await orchestrator.run(duration_seconds=0.09)
+
+        assert 2 <= fast.runs <= 6
+
     asyncio.run(run())
 
 
@@ -386,6 +409,82 @@ def test_signal_logging_keeps_bounded_recent_history(tmp_path) -> None:
     assert observer.recent_trade_count == 5
 
 
+def test_signal_logging_prunes_inactive_pairs_from_periodic_compute(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=10_000, flush_interval_seconds=999)
+    live_pair = VerifiedContractPair(
+        polymarket_condition_id="pm-live",
+        polymarket_asset_id="pm-live-yes",
+        kalshi_ticker="KXLIVE",
+        rationale="fixture",
+    )
+    resolved_pairs = tuple(
+        VerifiedContractPair(
+            polymarket_condition_id=f"pm-resolved-{index:02d}",
+            polymarket_asset_id=f"pm-resolved-{index:02d}-yes",
+            kalshi_ticker=f"KXRESOLVED{index:02d}",
+            rationale="fixture",
+        )
+        for index in range(30)
+    )
+    observer = SignalEventObserver(
+        pairs=(*resolved_pairs, live_pair),
+        signal_writer=writer,
+    )
+    for index, pair in enumerate((*resolved_pairs, live_pair)):
+        ts = BASE_TS + index
+        observer.observe_many(
+            (
+                book_event(
+                    ts,
+                    pair.polymarket_condition_id,
+                    pair.polymarket_asset_id,
+                    BookSide.BID,
+                    "0.49",
+                    "10",
+                ),
+                book_event(
+                    ts,
+                    pair.polymarket_condition_id,
+                    pair.polymarket_asset_id,
+                    BookSide.ASK,
+                    "0.51",
+                    "10",
+                ),
+                book_event(ts, pair.kalshi_ticker, pair.kalshi_ticker, BookSide.BID, "0.69", "10"),
+                book_event(ts, pair.kalshi_ticker, pair.kalshi_ticker, BookSide.ASK, "0.71", "10"),
+            )
+        )
+    seen_pair_keys: list[tuple[str, str, str]] = []
+    original_compute = CrossVenueSignal.compute
+
+    def recording_compute(self: CrossVenueSignal, view):
+        seen_pair_keys.extend(
+            (
+                pair.polymarket_condition_id,
+                pair.polymarket_asset_id,
+                pair.kalshi_ticker,
+            )
+            for pair in self._pairs
+        )
+        return original_compute(self, view)
+
+    monkeypatch.setattr(CrossVenueSignal, "compute", recording_compute)
+
+    observer.set_pairs((live_pair,))
+    assert observer.compute_pending_signals() == 1
+
+    assert seen_pair_keys == [
+        (
+            live_pair.polymarket_condition_id,
+            live_pair.polymarket_asset_id,
+            live_pair.kalshi_ticker,
+        )
+    ]
+
+
 def test_signal_logging_infers_venue_for_unmapped_polymarket_no_token(tmp_path) -> None:
     writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=10_000, flush_interval_seconds=999)
     state = CollectorStateStore(data_dir=tmp_path, pairs_tracked=1)
@@ -476,6 +575,70 @@ def test_resolution_poller_is_idempotent(tmp_path) -> None:
         assert await poller.poll_once() == 1
         assert await poller.poll_once() == 0
         assert store.count == 1
+
+    asyncio.run(run())
+
+
+def test_resolution_poller_drops_resolved_pairs_from_live_registry_but_keeps_eval_store(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        live_pair = VerifiedContractPair(
+            polymarket_condition_id="pm-live",
+            polymarket_asset_id="pm-live-yes",
+            kalshi_ticker="KXLIVE",
+            rationale="fixture",
+        )
+        resolved_pairs = tuple(
+            VerifiedContractPair(
+                polymarket_condition_id=f"pm-resolved-{index:02d}",
+                polymarket_asset_id=f"pm-resolved-{index:02d}-yes",
+                kalshi_ticker=f"KXRESOLVED{index:02d}",
+                rationale="fixture",
+            )
+            for index in range(50)
+        )
+        all_pairs = (*resolved_pairs, live_pair)
+        registry = PairRegistry(all_pairs)
+        pair_store = CollectedPairStore(data_dir=tmp_path)
+        pair_store.save(all_pairs)
+        state = CollectorStateStore(data_dir=tmp_path, pairs_tracked=len(all_pairs))
+        writer = SignalParquetWriter(data_dir=tmp_path, buffer_size=10_000)
+        observer = SignalEventObserver(pairs=all_pairs, signal_writer=writer, state=state)
+        records = tuple(
+            ResolutionRecord(
+                venue="kalshi",
+                market_id=pair.kalshi_ticker,
+                resolved_outcome="yes",
+                resolved_at="2026-01-01T00:00:00Z",
+                fetched_at="2026-01-01T00:01:00Z",
+                raw_json=None,
+            )
+            for pair in resolved_pairs
+        )
+        store = ResolutionParquetStore(data_dir=tmp_path)
+        poller = ResolutionPoller(
+            pairs=registry.snapshot,
+            sources=(StaticResolutionSource(records),),
+            store=store,
+            state=state,
+            on_resolved=lambda fetched: _drop_resolved_live_pairs(
+                records=fetched,
+                registry=registry,
+                observer=observer,
+                state=state,
+            ),
+        )
+
+        assert await poller.poll_once() == len(resolved_pairs)
+
+        venues = {venue.venue: venue for venue in state.status.venues}
+        assert registry.snapshot() == (live_pair,)
+        assert live_pair in pair_store.load()
+        assert all(pair in pair_store.load() for pair in resolved_pairs)
+        assert state.status.pairs_tracked == 1
+        assert all(venue.reconnects == 0 for venue in venues.values())
+        assert all(not venue.gap_timestamps_ns for venue in venues.values())
 
     asyncio.run(run())
 
@@ -656,6 +819,16 @@ class FailsOnceTask:
         if self.runs == 1:
             raise RuntimeError("boom")
         await asyncio.sleep(0.1)
+
+
+class FastExitTask:
+    name = "fast"
+
+    def __init__(self) -> None:
+        self.runs = 0
+
+    async def run(self) -> None:
+        self.runs += 1
 
 
 class StableTask:

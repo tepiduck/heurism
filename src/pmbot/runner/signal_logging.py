@@ -147,8 +147,21 @@ class SignalEventObserver:
         self._venue_by_asset = _venue_map(pairs)
         self._signals_by_pair = _signal_map(pairs)
         self._pair_keys_by_identifier = _pair_identifier_map(pairs)
-        self._dirty_pair_keys.update(self._signals_by_pair)
         active_keys = set(self._signals_by_pair)
+        active_identifiers = set(self._pair_keys_by_identifier)
+        active_condition_ids = {pair.polymarket_condition_id for pair in pairs}
+        self._book.retain_assets(active_identifiers)
+        self._quote_clocks = {
+            asset_id: clock
+            for asset_id, clock in self._quote_clocks.items()
+            if asset_id in active_identifiers
+        }
+        self._gap_assets.intersection_update(active_identifiers)
+        self._gap_conditions.intersection_update(active_condition_ids)
+        self._dirty_pair_keys = {
+            pair_key for pair_key in self._dirty_pair_keys if pair_key in active_keys
+        }
+        self._dirty_pair_keys.update(active_keys)
         self._last_signal_fingerprints = {
             key: value
             for key, value in self._last_signal_fingerprints.items()

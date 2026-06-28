@@ -37,11 +37,13 @@ class ResolutionPoller:
         sources: tuple[ResolutionSource, ...],
         store: ResolutionParquetStore,
         state: CollectorStateStore | None = None,
+        on_resolved: Callable[[tuple[ResolutionRecord, ...]], None] | None = None,
     ) -> None:
         self._pairs = pairs
         self._sources = sources
         self._store = store
         self._state = state
+        self._on_resolved = on_resolved
 
     async def poll_once(self) -> int:
         """Run one resolution poll and return newly written rows."""
@@ -49,6 +51,8 @@ class ResolutionPoller:
         pairs = self._pairs() if callable(self._pairs) else self._pairs
         for source in self._sources:
             fetched.extend(await source.fetch(pairs))
+        if fetched and self._on_resolved is not None:
+            self._on_resolved(tuple(fetched))
         written = self._store.record_many(fetched)
         if self._state is not None:
             self._state.note_resolutions(written)

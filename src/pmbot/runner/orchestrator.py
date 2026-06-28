@@ -39,6 +39,7 @@ class CollectorOrchestrator:
     resolution_poller: PollerTask | None = None
     backoff: BackoffPolicy = BackoffPolicy(initial_seconds=1.0, max_seconds=30.0)
     resolution_interval_seconds: float = 900.0
+    min_successful_uptime_seconds: float = 30.0
 
     async def run(self, *, duration_seconds: float | None = None) -> None:
         """Run supervised tasks until cancelled or optional duration expires."""
@@ -62,9 +63,19 @@ class CollectorOrchestrator:
     async def _supervise_venue(self, venue_task: VenueTask, *, deadline: float | None) -> None:
         attempt = 0
         while deadline is None or time.monotonic() < deadline:
+            started_at = time.monotonic()
             try:
                 await venue_task.run()
-                attempt = 0
+                uptime = time.monotonic() - started_at
+                if uptime >= self.min_successful_uptime_seconds:
+                    attempt = 0
+                else:
+                    attempt += 1
+                    LOGGER.warning(
+                        "venue task %s exited after %.3fs; preserving reconnect backoff",
+                        venue_task.name,
+                        uptime,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

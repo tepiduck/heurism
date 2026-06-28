@@ -58,6 +58,20 @@ class OrderBookState:
         clone._snapshot_keys = dict(self._snapshot_keys)
         return clone
 
+    def retain_assets(self, asset_ids: set[str]) -> None:
+        """Drop cached state for assets outside the active subscription set."""
+        self._bids = {
+            asset_id: levels for asset_id, levels in self._bids.items() if asset_id in asset_ids
+        }
+        self._asks = {
+            asset_id: levels for asset_id, levels in self._asks.items() if asset_id in asset_ids
+        }
+        self._snapshot_keys = {
+            asset_id: key
+            for asset_id, key in self._snapshot_keys.items()
+            if asset_id in asset_ids
+        }
+
     def queue_ahead(
         self,
         order: OrderRequest,

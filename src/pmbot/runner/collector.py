@@ -137,11 +137,20 @@ async def run_collector(
                 "startup World Cup discovery failed; continuing with loaded allowlist",
                 exc_info=True,
             )
+        def drop_resolved_from_live_subscriptions(records: tuple[ResolutionRecord, ...]) -> None:
+            _drop_resolved_live_pairs(
+                records=records,
+                registry=registry,
+                observer=observer,
+                state=state,
+            )
+
         poller = ResolutionPoller(
             pairs=registry.snapshot,
             sources=resolution_sources,
             store=resolution_store,
             state=state,
+            on_resolved=drop_resolved_from_live_subscriptions,
         )
         venue_tasks = (
             PolymarketVenueTask(
@@ -219,6 +228,28 @@ def _pair_is_resolved(pair: VerifiedContractPair, resolved_market_ids: set[str])
         pair.polymarket_condition_id in resolved_market_ids
         or pair.kalshi_ticker in resolved_market_ids
     )
+
+
+def _drop_resolved_live_pairs(
+    *,
+    records: tuple[ResolutionRecord, ...],
+    registry: PairRegistry,
+    observer: SignalEventObserver | None = None,
+    state: CollectorStateStore | None = None,
+) -> tuple[VerifiedContractPair, ...]:
+    """Remove resolved markets from live subscriptions while retaining persisted pairs."""
+    resolved_market_ids = {record.market_id for record in records}
+    if not resolved_market_ids:
+        return registry.snapshot()
+    next_pairs = tuple(
+        pair for pair in registry.snapshot() if not _pair_is_resolved(pair, resolved_market_ids)
+    )
+    changed = registry.replace(next_pairs)
+    if changed and observer is not None:
+        observer.set_pairs(next_pairs)
+    if changed and state is not None:
+        state.set_pairs_tracked(len(next_pairs))
+    return next_pairs
 
 
 class PolymarketVenueTask:
