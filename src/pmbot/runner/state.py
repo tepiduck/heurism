@@ -29,9 +29,11 @@ class CollectorStateStore:
         relative_path: Path = STATUS_RELATIVE_PATH,
     ) -> None:
         self._path = status_path or data_dir / relative_path
-        self._status = self._load() or CollectorStatus(
-            started_at_ns=time.time_ns(),
-            updated_at_ns=time.time_ns(),
+        process_started_at_ns = time.time_ns()
+        loaded = self._load()
+        self._status = loaded or CollectorStatus(
+            started_at_ns=process_started_at_ns,
+            updated_at_ns=process_started_at_ns,
             pairs_tracked=pairs_tracked,
             resolutions_collected=0,
             venues=(
@@ -40,7 +42,7 @@ class CollectorStateStore:
             ),
         )
         self._status = CollectorStatus(
-            started_at_ns=self._status.started_at_ns,
+            started_at_ns=process_started_at_ns,
             updated_at_ns=time.time_ns(),
             pairs_tracked=pairs_tracked,
             resolutions_collected=self._status.resolutions_collected,

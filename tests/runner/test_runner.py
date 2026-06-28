@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import polars as pl
 
+import pmbot.runner.state as state_module
 from pmbot.ingestion.clob import BackoffPolicy
 from pmbot.ingestion.schemas import (
     BookEvent,
@@ -496,6 +497,45 @@ def test_status_handles_corrupt_or_partial_status_file(tmp_path) -> None:
 
     store = CollectorStateStore(data_dir=tmp_path, pairs_tracked=3)
     assert store.status.pairs_tracked == 3
+
+
+def test_state_store_resets_started_at_for_new_process(tmp_path, monkeypatch) -> None:
+    status_path = tmp_path / STATUS_RELATIVE_PATH
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "started_at_ns": BASE_TS - 3_600_000_000_000,
+                "updated_at_ns": BASE_TS - 1_000_000_000,
+                "pairs_tracked": 1,
+                "resolutions_collected": 7,
+                "venues": [
+                    {
+                        "venue": "polymarket",
+                        "last_frame_ns": BASE_TS - 5_000_000_000,
+                        "frames_total": 42,
+                        "reconnects": 2,
+                        "gap_timestamps_ns": [BASE_TS - 10_000_000_000],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    times = iter((BASE_TS, BASE_TS + 1, BASE_TS + 2))
+    monkeypatch.setattr(state_module.time, "time_ns", lambda: next(times))
+
+    store = CollectorStateStore(data_dir=tmp_path, pairs_tracked=3)
+    persisted = load_status(tmp_path)
+
+    assert store.status.started_at_ns == BASE_TS
+    assert store.status.updated_at_ns == BASE_TS + 1
+    assert store.status.pairs_tracked == 3
+    assert store.status.resolutions_collected == 7
+    assert store.status.venues[0].frames_total == 42
+    assert persisted is not None
+    assert persisted.started_at_ns == BASE_TS
+    assert "uptime: 1m00s" in render_status(persisted, now_ns=BASE_TS + 60_000_000_000)
 
 
 class FailsOnceTask:
