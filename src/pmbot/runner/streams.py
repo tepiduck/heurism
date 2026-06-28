@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import polars as pl
 
+from pmbot.ingestion.parquet_normalization import normalize_rows_for_schema
 from pmbot.ingestion.schemas import DECIMAL_PRECISION, DECIMAL_SCALE
 from pmbot.runner.models import ResolutionRecord, SignalRecord
 
@@ -113,9 +114,8 @@ class SignalParquetWriter:
         )
         partition_dir.mkdir(parents=True, exist_ok=True)
         output_path = partition_dir / f"part-{time.time_ns()}-{uuid.uuid4().hex}.parquet"
-        pl.DataFrame([asdict(record) for record in records]).cast(SIGNAL_SCHEMA).write_parquet(
-            output_path
-        )
+        rows = normalize_rows_for_schema([asdict(record) for record in records], SIGNAL_SCHEMA)
+        pl.DataFrame(rows).cast(SIGNAL_SCHEMA).write_parquet(output_path)
         self._buffers[condition_id] = []
         self._last_flush_monotonic = time.monotonic()
 
@@ -170,9 +170,8 @@ class ResolutionParquetStore:
         )
         partition_dir.mkdir(parents=True, exist_ok=True)
         output_path = partition_dir / f"part-{time.time_ns()}-{uuid.uuid4().hex}.parquet"
-        pl.DataFrame([asdict(record) for record in records]).cast(RESOLUTION_SCHEMA).write_parquet(
-            output_path
-        )
+        rows = normalize_rows_for_schema([asdict(record) for record in records], RESOLUTION_SCHEMA)
+        pl.DataFrame(rows).cast(RESOLUTION_SCHEMA).write_parquet(output_path)
 
     def _load_seen(self) -> set[tuple[str, str, str]]:
         root = self._root / "resolutions"

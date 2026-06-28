@@ -120,8 +120,13 @@ def handler(request: httpx.Request) -> httpx.Response:
                 "event_type": "book",
                 "asset_id": "asset-a",
                 "market": "condition-a",
-                "bids": [{"price": "0.49", "size": "10"}],
-                "asks": [{"price": "0.51", "size": "10"}],
+                "bids": [
+                    {
+                        "price": "0.000000000000000000000000000000000000001",
+                        "size": "0.000000000000000000000000000000000000001",
+                    }
+                ],
+                "asks": [{"price": "0.510000000000000001", "size": "10.123456789012345678"}],
                 "timestamp": "1",
             },
             {

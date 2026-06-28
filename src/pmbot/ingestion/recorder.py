@@ -9,12 +9,13 @@ import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict
 from datetime import UTC, date, datetime
-from decimal import ROUND_HALF_UP, Decimal, localcontext
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
 import polars as pl
 
+from pmbot.ingestion.parquet_normalization import normalize_rows_for_schema
 from pmbot.ingestion.schemas import (
     DECIMAL_PRECISION,
     DECIMAL_SCALE,
@@ -30,11 +31,6 @@ from pmbot.ingestion.schemas import (
 T = TypeVar("T")
 DEFAULT_RECORDER_BUFFER_SIZE = 10_000
 DEFAULT_MAX_RECORDED_DEPTH = 10
-PARQUET_DECIMAL_QUANTUM = Decimal(1).scaleb(-DECIMAL_SCALE)
-PARQUET_DECIMAL_MAX = Decimal(
-    f"{'9' * (DECIMAL_PRECISION - DECIMAL_SCALE)}.{'9' * DECIMAL_SCALE}"
-)
-PARQUET_DECIMAL_MIN = -PARQUET_DECIMAL_MAX
 METADATA_RAW_JSON_KEYS = frozenset(
     {
         "__event_end_date",
@@ -377,18 +373,32 @@ class _BookDepthWriteFilter:
 
 def _events_to_frame(stream: str, events: Sequence[NormalizedEvent]) -> pl.DataFrame:
     if stream == "book":
-        return pl.DataFrame([_book_row(event) for event in _only(events, BookEvent)]).cast(
-            BOOK_SCHEMA
-        )
+        return pl.DataFrame(
+            normalize_rows_for_schema(
+                [_book_row(event) for event in _only(events, BookEvent)],
+                BOOK_SCHEMA,
+            )
+        ).cast(BOOK_SCHEMA)
     if stream == "trade":
-        return pl.DataFrame([_trade_row(event) for event in _only(events, TradeEvent)]).cast(
-            TRADE_SCHEMA
-        )
+        return pl.DataFrame(
+            normalize_rows_for_schema(
+                [_trade_row(event) for event in _only(events, TradeEvent)],
+                TRADE_SCHEMA,
+            )
+        ).cast(TRADE_SCHEMA)
     if stream == "gap-log":
-        return pl.DataFrame([_gap_row(event) for event in _only(events, GapEvent)]).cast(GAP_SCHEMA)
+        return pl.DataFrame(
+            normalize_rows_for_schema(
+                [_gap_row(event) for event in _only(events, GapEvent)],
+                GAP_SCHEMA,
+            )
+        ).cast(GAP_SCHEMA)
     if stream == "metadata":
         return pl.DataFrame(
-            [_metadata_row(event) for event in _only(events, MetadataSnapshot)]
+            normalize_rows_for_schema(
+                [_metadata_row(event) for event in _only(events, MetadataSnapshot)],
+                METADATA_SCHEMA,
+            )
         ).cast(METADATA_SCHEMA)
     raise ValueError(f"unknown stream: {stream}")
 
@@ -406,17 +416,14 @@ def _book_row(event: BookEvent) -> dict[str, object]:
         "asset_id": event.asset_id,
         "event_type": event.event_type.value,
         "side": event.side.value,
-        "price": _parquet_decimal(event.price),
-        "size": _parquet_decimal(event.size),
+        "price": event.price,
+        "size": event.size,
         "seq_or_hash": event.seq_or_hash,
     }
 
 
 def _trade_row(event: TradeEvent) -> dict[str, object]:
-    row = asdict(event)
-    row["price"] = _parquet_decimal(event.price)
-    row["size"] = _parquet_decimal(event.size)
-    return row
+    return asdict(event)
 
 
 def _gap_row(event: GapEvent) -> dict[str, object]:
@@ -435,22 +442,10 @@ def _metadata_row(event: MetadataSnapshot) -> dict[str, object]:
         "resolution_or_end_time": event.resolution_or_end_time,
         "active": event.active,
         "closed": event.closed,
-        "liquidity": _optional_parquet_decimal(event.liquidity),
-        "volume": _optional_parquet_decimal(event.volume),
+        "liquidity": event.liquidity,
+        "volume": event.volume,
         "raw_json": _trim_metadata_raw_json(event.raw_json),
     }
-
-
-def _optional_parquet_decimal(value: Decimal | None) -> Decimal | None:
-    return None if value is None else _parquet_decimal(value)
-
-
-def _parquet_decimal(value: Decimal) -> Decimal:
-    """Clamp normalized Decimal values to the persisted Decimal(38, 12) schema."""
-    clamped = min(max(value, PARQUET_DECIMAL_MIN), PARQUET_DECIMAL_MAX)
-    with localcontext() as context:
-        context.prec = DECIMAL_PRECISION + 8
-        return clamped.quantize(PARQUET_DECIMAL_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _metadata_content_hash(event: MetadataSnapshot) -> str:
