@@ -1,10 +1,12 @@
 import asyncio
 from collections.abc import Iterable
+from decimal import Decimal
 
 import httpx
 import polars as pl
 
 from pmbot.ingestion.clob import BackoffPolicy, ClobHttpClient, MarketDataIngestor
+from pmbot.ingestion.parsers import parse_ws_frame
 from pmbot.ingestion.recorder import ParquetRecorder
 from pmbot.ingestion.schemas import GapReason
 
@@ -35,6 +37,54 @@ def test_market_data_ingestor_records_fresh_snapshots_and_reconnect_gaps(tmp_pat
         assert set(reconnects["condition_id"].to_list()) == {"condition-a", "condition-b"}
 
     asyncio.run(run())
+
+
+def test_polymarket_extreme_precision_book_frame_records_without_decimal_scale_error(
+    tmp_path,
+) -> None:
+    frame = """
+    {
+      "event_type": "book",
+      "asset_id": "asset-precision",
+      "market": "condition-precision",
+      "bids": [
+        {
+          "price": "0.123456789012345678",
+          "size": "123.123456789012345678"
+        }
+      ],
+      "asks": [
+        {
+          "price": "0.000000000000000000000000000000000000001",
+          "size": "0.000000000000000000000000000000000000001"
+        }
+      ],
+      "timestamp": "1"
+    }
+    """
+    recorder = ParquetRecorder(
+        data_dir=tmp_path,
+        buffer_size=100,
+        flush_interval_seconds=999,
+    )
+
+    recorder.record_many(parse_ws_frame(frame, ts_local_ns=1, ts_monotonic_ns=2))
+    recorder.flush_all()
+
+    book_frame = pl.read_parquet(
+        list(tmp_path.glob("raw/book/date=*/market=condition-precision/*.parquet"))
+    ).sort("side")
+
+    assert book_frame.schema["price"] == pl.Decimal(38, 12)
+    assert book_frame.schema["size"] == pl.Decimal(38, 12)
+    assert book_frame["price"].to_list() == [
+        Decimal("0E-12"),
+        Decimal("0.123456789012"),
+    ]
+    assert book_frame["size"].to_list() == [
+        Decimal("0E-12"),
+        Decimal("123.123456789012"),
+    ]
 
 
 class FailsOnceIngestor(MarketDataIngestor):

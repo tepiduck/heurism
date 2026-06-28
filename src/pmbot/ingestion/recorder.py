@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -30,6 +30,11 @@ from pmbot.ingestion.schemas import (
 T = TypeVar("T")
 DEFAULT_RECORDER_BUFFER_SIZE = 10_000
 DEFAULT_MAX_RECORDED_DEPTH = 10
+PARQUET_DECIMAL_QUANTUM = Decimal(1).scaleb(-DECIMAL_SCALE)
+PARQUET_DECIMAL_MAX = Decimal(
+    f"{'9' * (DECIMAL_PRECISION - DECIMAL_SCALE)}.{'9' * DECIMAL_SCALE}"
+)
+PARQUET_DECIMAL_MIN = -PARQUET_DECIMAL_MAX
 METADATA_RAW_JSON_KEYS = frozenset(
     {
         "__event_end_date",
@@ -401,14 +406,17 @@ def _book_row(event: BookEvent) -> dict[str, object]:
         "asset_id": event.asset_id,
         "event_type": event.event_type.value,
         "side": event.side.value,
-        "price": event.price,
-        "size": event.size,
+        "price": _parquet_decimal(event.price),
+        "size": _parquet_decimal(event.size),
         "seq_or_hash": event.seq_or_hash,
     }
 
 
 def _trade_row(event: TradeEvent) -> dict[str, object]:
-    return asdict(event)
+    row = asdict(event)
+    row["price"] = _parquet_decimal(event.price)
+    row["size"] = _parquet_decimal(event.size)
+    return row
 
 
 def _gap_row(event: GapEvent) -> dict[str, object]:
@@ -427,10 +435,22 @@ def _metadata_row(event: MetadataSnapshot) -> dict[str, object]:
         "resolution_or_end_time": event.resolution_or_end_time,
         "active": event.active,
         "closed": event.closed,
-        "liquidity": event.liquidity,
-        "volume": event.volume,
+        "liquidity": _optional_parquet_decimal(event.liquidity),
+        "volume": _optional_parquet_decimal(event.volume),
         "raw_json": _trim_metadata_raw_json(event.raw_json),
     }
+
+
+def _optional_parquet_decimal(value: Decimal | None) -> Decimal | None:
+    return None if value is None else _parquet_decimal(value)
+
+
+def _parquet_decimal(value: Decimal) -> Decimal:
+    """Clamp normalized Decimal values to the persisted Decimal(38, 12) schema."""
+    clamped = min(max(value, PARQUET_DECIMAL_MIN), PARQUET_DECIMAL_MAX)
+    with localcontext() as context:
+        context.prec = DECIMAL_PRECISION + 8
+        return clamped.quantize(PARQUET_DECIMAL_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _metadata_content_hash(event: MetadataSnapshot) -> str:
