@@ -78,3 +78,30 @@ def test_checksum_mismatch_emits_gap_event() -> None:
     assert len(gaps) == 1
     assert gaps[0].reason == GapReason.CHECKSUM_MISMATCH
     assert gaps[0].ts_monotonic_ns == 40
+
+
+def test_delta_without_snapshot_does_not_emit_checksum_mismatch() -> None:
+    processor = MarketDataProcessor(verify_hashes=True)
+
+    events = processor.process_payload(
+        {
+            "event_type": "price_change",
+            "market": "condition-1",
+            "timestamp": "1",
+            "price_changes": [
+                {
+                    "asset_id": "asset-yes",
+                    "price": "0.49",
+                    "size": "20",
+                    "side": "BUY",
+                    "hash": "not-verifiable-yet",
+                }
+            ],
+        },
+        ts_local_ns=500,
+        ts_monotonic_ns=50,
+    )
+
+    gaps = [event for event in events if isinstance(event, GapEvent)]
+
+    assert [gap.reason for gap in gaps] == [GapReason.MISSING_SNAPSHOT]

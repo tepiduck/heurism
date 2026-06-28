@@ -4,8 +4,16 @@ from decimal import Decimal
 
 import polars as pl
 
+from pmbot.ingestion.hashing import compute_order_book_hash
+from pmbot.ingestion.processor import MarketDataProcessor
 from pmbot.ingestion.recorder import ParquetRecorder
-from pmbot.ingestion.schemas import BookEvent, BookEventType, BookSide, MetadataSnapshot
+from pmbot.ingestion.schemas import (
+    BookEvent,
+    BookEventType,
+    BookSide,
+    GapEvent,
+    MetadataSnapshot,
+)
 
 
 def test_recorder_round_trip_preserves_decimal_schema_and_values(tmp_path) -> None:
@@ -100,6 +108,110 @@ def test_recorder_caps_book_depth_and_emits_boundary_deltas(tmp_path) -> None:
         ("snapshot", "bid", Decimal("0.5000000000"), Decimal("10.0000000000"), "snapshot"),
         ("delta", "bid", Decimal("0.4800000000"), Decimal("30.0000000000"), "delta-1"),
         ("delta", "bid", Decimal("0.5000000000"), Decimal("0E-10"), "delta-1"),
+    ]
+
+
+def test_full_depth_checksum_verification_is_independent_of_persisted_depth_cap(
+    tmp_path,
+) -> None:
+    processor = MarketDataProcessor(verify_hashes=True)
+    recorder = ParquetRecorder(
+        data_dir=tmp_path,
+        buffer_size=100,
+        flush_interval_seconds=999,
+        partition_date=lambda: date(2026, 6, 24),
+        max_recorded_depth=2,
+    )
+    condition_id = "0xcondition"
+    asset_id = "123456789012345678901234567890"
+    bids = [
+        {"price": "0.47", "size": "40"},
+        {"price": "0.48", "size": "30"},
+        {"price": "0.49", "size": "20"},
+        {"price": "0.50", "size": "10"},
+    ]
+    asks = [
+        {"price": "0.54", "size": "40"},
+        {"price": "0.53", "size": "30"},
+        {"price": "0.52", "size": "20"},
+        {"price": "0.51", "size": "10"},
+    ]
+    snapshot = {
+        "asset_id": asset_id,
+        "market": condition_id,
+        "bids": bids,
+        "asks": asks,
+        "timestamp": "1757908892351",
+        "min_order_size": "5",
+        "tick_size": "0.01",
+        "neg_risk": False,
+        "last_trade_price": "0.50",
+    }
+    snapshot["hash"] = compute_order_book_hash(
+        market=condition_id,
+        asset_id=asset_id,
+        timestamp="1757908892351",
+        bids=bids,
+        asks=asks,
+        min_order_size="5",
+        tick_size="0.01",
+        neg_risk=False,
+        last_trade_price="0.50",
+    )
+    snapshot_events = processor.process_payload(snapshot, ts_local_ns=123, ts_monotonic_ns=456)
+
+    assert not [event for event in snapshot_events if isinstance(event, GapEvent)]
+    recorder.record_many(snapshot_events)
+
+    changed_bids = [
+        {"price": "0.47", "size": "777"},
+        {"price": "0.48", "size": "30"},
+        {"price": "0.49", "size": "20"},
+        {"price": "0.50", "size": "10"},
+    ]
+    delta_hash = compute_order_book_hash(
+        market=condition_id,
+        asset_id=asset_id,
+        timestamp="1757908892352",
+        bids=changed_bids,
+        asks=asks,
+        min_order_size="5",
+        tick_size="0.01",
+        neg_risk=False,
+        last_trade_price="0.50",
+    )
+    delta = {
+        "event_type": "price_change",
+        "market": condition_id,
+        "timestamp": "1757908892352",
+        "price_changes": [
+            {
+                "asset_id": asset_id,
+                "price": "0.47",
+                "size": "777",
+                "side": "BUY",
+                "hash": delta_hash,
+            }
+        ],
+    }
+    delta_events = processor.process_payload(delta, ts_local_ns=124, ts_monotonic_ns=457)
+
+    assert not [event for event in delta_events if isinstance(event, GapEvent)]
+    recorder.record_many(delta_events)
+    recorder.flush_all()
+
+    files = list(
+        (tmp_path / "raw" / "book" / "date=2026-06-24" / f"market={condition_id}").glob(
+            "*.parquet"
+        )
+    )
+    frame = pl.read_parquet(files).sort(["side", "price"])
+
+    assert frame.select("event_type", "side", "price", "size").rows() == [
+        ("snapshot", "ask", Decimal("0.5100000000"), Decimal("10.0000000000")),
+        ("snapshot", "ask", Decimal("0.5200000000"), Decimal("20.0000000000")),
+        ("snapshot", "bid", Decimal("0.4900000000"), Decimal("20.0000000000")),
+        ("snapshot", "bid", Decimal("0.5000000000"), Decimal("10.0000000000")),
     ]
 
 

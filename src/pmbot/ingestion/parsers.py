@@ -72,7 +72,7 @@ def _parse_message(
     ts_monotonic_ns: int | None,
 ) -> list[BookEvent | TradeEvent]:
     event_type = _optional_str(message.get("event_type"))
-    if event_type == "book":
+    if event_type == "book" or (event_type is None and _is_book_snapshot(message)):
         book_events: list[BookEvent | TradeEvent] = []
         book_events.extend(_parse_book(message, ts_local_ns, ts_monotonic_ns))
         return book_events
@@ -209,6 +209,15 @@ def _level_sequence(value: object) -> Sequence[Mapping[str, object]]:
             raise TypeError("book side levels must be objects")
         levels.append(cast(Mapping[str, object], item))
     return levels
+
+
+def _is_book_snapshot(message: Mapping[str, object]) -> bool:
+    return (
+        "market" in message
+        and "asset_id" in message
+        and "bids" in message
+        and "asks" in message
+    )
 
 
 def _required_str(message: Mapping[str, object], key: str) -> str:

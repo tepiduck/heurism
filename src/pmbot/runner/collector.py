@@ -252,6 +252,31 @@ def _drop_resolved_live_pairs(
     return next_pairs
 
 
+def _polymarket_book_token_ids(
+    pairs: Sequence[VerifiedContractPair],
+    snapshots: Sequence[MetadataSnapshot] = (),
+) -> tuple[str, ...]:
+    """Return every Polymarket token needed to reconstruct subscribed books."""
+    tracked_conditions = {pair.polymarket_condition_id for pair in pairs}
+    token_ids: list[str] = []
+    seen: set[str] = set()
+    for pair in pairs:
+        for token_id in (pair.polymarket_asset_id, pair.polymarket_no_asset_id):
+            if token_id is None or token_id in seen:
+                continue
+            seen.add(token_id)
+            token_ids.append(token_id)
+    for snapshot in snapshots:
+        if snapshot.condition_id not in tracked_conditions:
+            continue
+        for token_id in snapshot.token_ids:
+            if token_id in seen:
+                continue
+            seen.add(token_id)
+            token_ids.append(token_id)
+    return tuple(token_ids)
+
+
 class PolymarketVenueTask:
     """Read-only Polymarket Gamma + CLOB ingestion task."""
 
@@ -287,7 +312,7 @@ class PolymarketVenueTask:
         self._recorder.record_many(snapshots)
         self._recorder.flush_all()
         ingestor = MarketDataIngestor(
-            token_ids=(pair.polymarket_asset_id for pair in pairs),
+            token_ids=_polymarket_book_token_ids(pairs, snapshots),
             recorder=self._recorder,
             clob_http=self._clob_http,
             ws_url=self._ws_url,

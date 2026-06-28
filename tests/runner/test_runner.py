@@ -20,6 +20,7 @@ from pmbot.ingestion.schemas import (
 from pmbot.runner.allowlist import load_verified_pairs
 from pmbot.runner.collector import (
     _drop_resolved_live_pairs,
+    _polymarket_book_token_ids,
     _record_startup_resolutions,
     _tracked_polymarket_metadata,
 )
@@ -641,6 +642,45 @@ def test_resolution_poller_drops_resolved_pairs_from_live_registry_but_keeps_eva
         assert all(not venue.gap_timestamps_ns for venue in venues.values())
 
     asyncio.run(run())
+
+
+def test_polymarket_book_token_ids_include_no_token_and_metadata_backfill() -> None:
+    pair_with_no = VerifiedContractPair(
+        polymarket_condition_id="pm-with-no",
+        polymarket_asset_id="pm-with-no-yes",
+        polymarket_no_asset_id="pm-with-no-no",
+        kalshi_ticker="KXWITHNO",
+        rationale="fixture",
+    )
+    pair_missing_no = VerifiedContractPair(
+        polymarket_condition_id="pm-missing-no",
+        polymarket_asset_id="pm-missing-no-yes",
+        kalshi_ticker="KXMISSINGNO",
+        rationale="fixture",
+    )
+    metadata_backfill = MetadataSnapshot(
+        fetched_at="2026-06-24T00:00:00Z",
+        condition_id="pm-missing-no",
+        question="Fixture?",
+        outcomes=("Yes", "No"),
+        token_ids=("pm-missing-no-yes", "pm-missing-no-no"),
+        resolution_or_end_time=None,
+        active=True,
+        closed=False,
+        liquidity=None,
+        volume=None,
+        raw_json=None,
+    )
+
+    assert _polymarket_book_token_ids(
+        (pair_with_no, pair_missing_no),
+        (metadata_backfill,),
+    ) == (
+        "pm-with-no-yes",
+        "pm-with-no-no",
+        "pm-missing-no-yes",
+        "pm-missing-no-no",
+    )
 
 
 def test_startup_resolution_filter_skips_closed_pair_without_reconnect_churn(tmp_path) -> None:

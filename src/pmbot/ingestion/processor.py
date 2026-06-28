@@ -24,12 +24,16 @@ class _BookState:
     condition_id: str
     asset_id: str
     timestamp: str
+    min_order_size: str = ""
+    tick_size: str = ""
+    neg_risk: bool = False
+    last_trade_price: str = ""
     bids: dict[Decimal, Decimal] = field(default_factory=dict)
     asks: dict[Decimal, Decimal] = field(default_factory=dict)
 
     def levels(self, side: BookSide) -> list[dict[str, str]]:
         levels = self.bids if side == BookSide.BID else self.asks
-        reverse = side == BookSide.BID
+        reverse = side == BookSide.ASK
         return [
             {"price": str(price), "size": str(size)}
             for price, size in sorted(levels.items(), reverse=reverse)
@@ -42,6 +46,10 @@ class _BookState:
             timestamp=self.timestamp,
             bids=self.levels(BookSide.BID),
             asks=self.levels(BookSide.ASK),
+            min_order_size=self.min_order_size,
+            tick_size=self.tick_size,
+            neg_risk=self.neg_risk,
+            last_trade_price=self.last_trade_price,
         )
 
 
@@ -165,7 +173,7 @@ class MarketDataProcessor:
         ts_monotonic_ns: int | None,
     ) -> list[GapEvent]:
         event_type = _optional_str(message.get("event_type"))
-        if event_type == "book":
+        if event_type == "book" or (event_type is None and _is_book_snapshot(message)):
             return self._apply_snapshot(message, ts_local_ns, ts_monotonic_ns)
         if event_type == "price_change":
             return self._apply_delta(message, ts_local_ns, ts_monotonic_ns)
@@ -184,6 +192,10 @@ class MarketDataProcessor:
             condition_id=condition_id,
             asset_id=asset_id,
             timestamp=ts_exchange,
+            min_order_size=_optional_str(message.get("min_order_size")) or "",
+            tick_size=_optional_str(message.get("tick_size")) or "",
+            neg_risk=_optional_bool(message.get("neg_risk")),
+            last_trade_price=_optional_str(message.get("last_trade_price")) or "",
             bids=_levels_by_price(message.get("bids")),
             asks=_levels_by_price(message.get("asks")),
         )
@@ -227,6 +239,7 @@ class MarketDataProcessor:
             change = cast(Mapping[str, object], raw_change)
             asset_id = _required_str(change, "asset_id")
             state = self._books.get(asset_id)
+            has_trusted_snapshot = state is not None
             if state is None:
                 state = _BookState(
                     condition_id=condition_id,
@@ -257,9 +270,11 @@ class MarketDataProcessor:
                 levels[price] = size
 
             expected_hash = _optional_str(change.get("hash"))
-            if self._verify_hashes and expected_hash is not None and not hashes_match(
-                expected_hash,
-                state.hash(),
+            if (
+                has_trusted_snapshot
+                and self._verify_hashes
+                and expected_hash is not None
+                and not hashes_match(expected_hash, state.hash())
             ):
                 gaps.append(
                     GapEvent(
@@ -324,6 +339,15 @@ def _levels_by_price(value: object) -> dict[Decimal, Decimal]:
     return levels
 
 
+def _is_book_snapshot(message: Mapping[str, object]) -> bool:
+    return (
+        "market" in message
+        and "asset_id" in message
+        and "bids" in message
+        and "asks" in message
+    )
+
+
 def _book_side_from_venue(side: str) -> BookSide:
     normalized = side.upper()
     if normalized in {"BUY", "BID"}:
@@ -354,3 +378,11 @@ def _optional_str(value: object) -> str | None:
     if isinstance(value, int | Decimal):
         return str(value)
     raise TypeError(f"expected string-compatible value, got {type(value).__name__}")
+
+
+def _optional_bool(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise TypeError(f"expected bool-compatible value, got {type(value).__name__}")
