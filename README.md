@@ -2,6 +2,8 @@
 
 Python 3.11 scaffold for Polymarket microstructure trading research and execution.
 
+UPDATE: lowkey rage quit this project because of how annoying collecting training data is, but someone with more patience than me can use it
+
 ## Data Collector
 
 Run the read-only collector with a human-curated verified-pair allowlist:
