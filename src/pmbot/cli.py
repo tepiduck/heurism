@@ -25,7 +25,7 @@ from pmbot.runner import (
 )
 
 app = typer.Typer(
-    help="Polymarket microstructure research and execution scaffold.",
+    help="Heurism: collect prediction-market data and evaluate research strategies.",
     no_args_is_help=True,
 )
 console = Console()

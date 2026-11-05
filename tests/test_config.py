@@ -46,5 +46,6 @@ def test_kalshi_credentials_load_without_plain_repr(monkeypatch: pytest.MonkeyPa
 
     assert isinstance(settings.KALSHI_API_KEY_ID, SecretStr)
     assert settings.KALSHI_API_KEY_ID.get_secret_value() == "test-key-id"
-    assert str(settings.KALSHI_PRIVATE_KEY_PATH) == "secrets/kalshi-test.pem"
+    assert settings.KALSHI_PRIVATE_KEY_PATH is not None
+    assert settings.KALSHI_PRIVATE_KEY_PATH.as_posix() == "secrets/kalshi-test.pem"
     assert "test-key-id" not in repr(settings)

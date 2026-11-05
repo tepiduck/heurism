@@ -1,119 +1,135 @@
-# pmbot
+# Heurism
 
-Python 3.11 scaffold for Polymarket microstructure trading research and execution.
+[![CI](https://github.com/tepiduck/heurism/actions/workflows/ci.yml/badge.svg)](https://github.com/tepiduck/heurism/actions/workflows/ci.yml)
 
-UPDATE: lowkey rage quit this project because of how annoying collecting training data is, but someone with more patience than me can use it
+**A Python research platform for building and testing prediction-market strategies.**
 
-## Data Collector
+Collect Polymarket and Kalshi market data, write your own strategy in Python,
+and replay it against recorded order books. Heurism provides data ingestion,
+an event-driven backtester, and evaluation tools so you can focus on the
+ideas you want to test.
 
-Run the read-only collector with a human-curated verified-pair allowlist:
+Start with the offline strategy lab, change its entry rule, then bring your
+own market data. No account or API credentials are needed for the demo.
 
-```bash
-pmbot run-collector --allowlist path/to/verified_pairs.jsonl
-```
+## What you can build
 
-The collector records Polymarket and Kalshi market data, cross-venue signal
-forecasts, gap logs, status heartbeats, and resolved outcomes. It never places
-orders.
+| Workflow | Included tools |
+| --- | --- |
+| Build datasets | Read-only collectors, normalized Parquet books and trades, gap logs, resolution polling |
+| Develop strategies | Python callbacks with point-in-time books, trades, and gap state |
+| Simulate execution | Market and limit orders, configurable latency, depth-based fills, queue modeling, and modeled costs |
+| Inspect results | Fill blotters, inventory, marked PnL, and data-validity flags |
+| Evaluate forecasts | Brier and log-loss scoring, calibration, clustered intervals, and parameter sweeps |
 
-Check freshness and heartbeat state:
+Heurism is a local Python toolkit and CLI. Order execution is simulated;
+live order placement is not implemented. The existing cross-venue strategy
+is one research example you can study and extend.
 
-```bash
-pmbot status
-```
+## Quick start
 
-## Evaluation
-
-Produce a WP-4 preliminary edge read from recorded raw books and resolutions:
-
-```bash
-pmbot eval --data-dir data --report out.json
-```
-
-For large archives, score a bounded window:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
 ```bash
-pmbot eval --data-dir data --report out.json --hours 6
+git clone https://github.com/tepiduck/heurism.git
+cd heurism
+uv sync --dev --locked
+uv run python examples/strategy_lab.py
 ```
 
-The eval runner replays `data/raw/book` through the current cross-venue signal
-code and joins the recomputed p-hat series to `data/resolutions`. It does not
-read `data/signals`, because that history can mix model versions. The JSON
-report is immutable, includes a config hash, raw data time range, clustered
-proper-score metrics, calibration/ECE, explicit guard counts, and a loud
-`small_n` flag when the number of distinct resolved matches is below the
-configured verdict threshold.
+The project uses **Python 3.11**; uv can install the required interpreter.
+The demo runs entirely offline after dependency installation. It submits a
+limit buy when the ask falls to or below a threshold and prints JSON containing
+the parameters, modeled costs, fills, inventory, and final marked PnL.
 
-By default the runner uses `pairs.draft.jsonl` as the verified pair mapping.
-Override it with `--allowlist path/to/pairs.jsonl`. Regression fitting is off by
-default; `--fit-regression` will only fit once the configured minimum number of
-distinct resolved events is available.
-
-## Raw Harvest Mode
-
-Use `pmbot harvest` for generic single-venue raw dataset building. Harvest mode
-records normalized order books, trades, gap logs, metadata, and optional
-resolved outcomes under `data/raw/`, but it does not construct cross-venue
-pairs, run contract mapping or resolution-criteria verification, compute
-signals, place orders, or touch execution paths.
-
-Select targeted markets explicitly:
+Try a different threshold or execution delay:
 
 ```bash
-pmbot harvest \
-  --polymarket-markets path/to/polymarket_ids.txt \
-  --kalshi-tickers path/to/kalshi_tickers.txt \
-  --duration 300
+uv run python examples/strategy_lab.py --entry-price 0.52 --latency-ms 500
+uv run python examples/strategy_lab.py --entry-price 0.48
+uv run python examples/strategy_lab.py --report reports/first-run.json
 ```
 
-Each Polymarket list row may contain condition IDs or numeric CLOB token/asset
-IDs. Each Kalshi list row contains market tickers. Blank lines and `#` comments
-are ignored, and comma-separated identifiers are accepted.
+The `0.48` threshold produces no orders on the demo books. Report files are
+created without overwriting earlier runs. Demo prices are **synthetic** and
+exist to illustrate the workflow; their PnL is not a performance result.
 
-You can also harvest targeted groups:
+## Develop your own strategy
+
+Open [`examples/strategy_lab.py`](examples/strategy_lab.py) and edit
+`EntryStrategy.__call__`. A strategy receives the current market view and
+returns zero or more `OrderRequest` objects. Read the current order book with
+`view.book(asset_id)`, inspect observed trades with `view.trades()`, and return
+`()` to wait. The example includes the complete callback and experiment runner.
+
+The starter makes at most one entry request per run, keeping the first
+experiment easy to inspect. Follow the [strategy development guide](docs/strategy-development.md)
+for the callback API, recorded-data replay, result interpretation, and current
+simulation limits.
+
+## Bring your own data
+
+Put current Polymarket condition IDs or CLOB token IDs in a text file, one
+per line, then collect a bounded sample:
 
 ```bash
-pmbot harvest \
-  --kalshi-series KXWCGAME \
-  --polymarket-series soccer-fifwc \
-  --data-dir data/harvest_wc \
-  --status-file data/harvest_wc/status.json \
-  --poll-resolutions
+uv run heurism harvest --polymarket-markets markets.txt --duration 300 --data-dir data/my-market
 ```
 
-Check the separate harvest heartbeat with:
+Replay the recorded books using the specific CLOB token ID you want to trade:
 
 ```bash
-pmbot harvest-status --data-dir data/harvest_wc --status-file data/harvest_wc/status.json
+uv run python examples/strategy_lab.py --data-dir data/my-market --asset-id YOUR_CLOB_TOKEN_ID --report reports/my-market.json
 ```
 
-Harvest runs can use a different `--data-dir` and `--status-file` from the
-strategy collector, so both processes can run independently without clobbering
-each other's `status.json`.
+For Kalshi collection, configure `KALSHI_API_KEY_ID` and
+`KALSHI_PRIVATE_KEY_PATH` in a local `.env` using [`.env.example`](.env.example).
+The [market-data guide](docs/market-data.md) covers both venues, status checks,
+cross-venue evaluation, and macOS background collection.
 
-There is intentionally no default "all active markets" harvest. Subscribing to
-thousands of live markets can hit websocket and connection limits and flood
-disk. Prefer explicit lists, venue series, or Polymarket tag/series slugs. If an
-all-active mode is added later, it should batch subscriptions and warn loudly.
+## Evaluate cross-venue forecasts
 
-## Run 24/7 On macOS
-
-The launchd template lives at `ops/launchd/com.pmbot.collector.plist`. Replace
-`__PROJECT_DIR__` and `__ALLOWLIST_PATH__` with absolute paths, and adjust the
-`uv` path if the target Mac does not use `/opt/homebrew/bin/uv`, then install it:
+The built-in `eval` command evaluates the included Polymarket/Kalshi signal
+using recorded books, resolved outcomes, and a verified contract-pair allowlist:
 
 ```bash
-mkdir -p data/collector
-cp ops/launchd/com.pmbot.collector.plist ~/Library/LaunchAgents/com.pmbot.collector.plist
-launchctl load ~/Library/LaunchAgents/com.pmbot.collector.plist
-launchctl start com.pmbot.collector
+uv run heurism eval --data-dir data --allowlist path/to/verified_pairs.jsonl --report reports/forecast-eval.json
 ```
 
-The plist runs the collector under `caffeinate -i` and sets `KeepAlive=true`, so
-launchd restarts it after crashes and reboots. Keep the MacBook plugged in,
-disable system sleep in Battery settings, and prevent lid-close sleep if the
-machine will run closed. For a manual foreground run, use:
+This command recomputes forecasts from raw books and reports scoring,
+calibration, and sample-size guards. It is separate from the custom-strategy
+backtest starter. Build your own current pair mapping using the
+[allowlist guide](ALLOWLIST_GUIDE.md); `pairs.draft.jsonl` contains historical
+research pairs.
+
+## Project map
+
+```text
+examples/strategy_lab.py  Editable offline and recorded-data experiment
+src/pmbot/
+  ingestion/             Venue adapters and normalized storage
+  backtest/              Replay engine, order models, and costs
+  features/              Order-book features
+  signals/               Contract matching and cross-venue signals
+  eval/                  Forecast and backtest evaluation components
+  risk/                  Sizing utilities
+  runner/                Collection, discovery, and process supervision
+tests/                   Unit and regression tests
+docs/                    Usage and strategy development guides
+```
+
+The Python package remains `pmbot`. Both `heurism` and `pmbot` invoke the
+same CLI, so existing imports and scripts continue to work.
+
+## Development
 
 ```bash
-caffeinate -i pmbot run-collector --allowlist path/to/verified_pairs.jsonl
+uv run ruff check .
+uv run mypy
+uv run pytest
+uv run heurism --help
 ```
+
+For a new strategy, start by defining the hypothesis, add a deterministic
+fixture that tests its behavior, then evaluate it on held-out recorded data.
+Include latency, cost assumptions, and data-quality flags when comparing runs.

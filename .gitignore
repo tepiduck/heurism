@@ -1,6 +1,7 @@
 .env
 secrets/
 data/
+reports/
 __pycache__/
 *.py[cod]
 .pytest_cache/
