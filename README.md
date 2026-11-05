@@ -25,9 +25,7 @@ The project uses Python 3.11, which uv can install for you. Once dependencies
 are installed, the example runs offline without API keys.
 
 It buys when the ask reaches a chosen price and prints a JSON report with
-fills, fees, inventory, and profit or loss (PnL). The prices are synthetic:
-this is a small example for learning the API, not evidence of a profitable
-strategy.
+fills, fees, inventory, and PnL.
 
 Try changing the entry price or latency, or save a report:
 
