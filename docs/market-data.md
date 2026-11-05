@@ -1,119 +1,135 @@
-# Market data and cross-venue evaluation
+# Collecting and evaluating market data
 
-These commands use the existing `pmbot` CLI, also available as `heurism`.
-Run them through `uv run` after completing the README setup.
-Use current market IDs and verified pairs; the checked-in World Cup examples are historical.
+Run these commands from the repository root after following the
+[setup instructions](../README.md#get-started). Both `heurism` and `pmbot`
+run the same CLI.
 
-## Data Collector
+## Collect a sample
 
-Run the read-only collector with a human-curated verified-pair allowlist:
+Use `harvest` to record selected markets. Put Polymarket condition IDs or
+CLOB token IDs in a text file, one per line:
+
+```bash
+uv run heurism harvest --polymarket-markets markets.txt --duration 300 --data-dir data/my-market
+```
+
+For Kalshi, put market tickers in a separate file:
+
+```bash
+uv run heurism harvest --kalshi-tickers tickers.txt --duration 300 --data-dir data/kalshi
+```
+
+You can pass both files in one command. Blank lines, lines starting with
+`#`, and comma-separated IDs are supported. Use current market IDs; the
+checked-in `pairs.draft.jsonl` contains historical World Cup pairs.
+
+To configure Kalshi authentication, copy [`.env.example`](../.env.example)
+to `.env` and set both `KALSHI_API_KEY_ID` and
+`KALSHI_PRIVATE_KEY_PATH`. Keep the key file under the ignored `secrets/`
+directory or outside the repository.
+
+Harvest writes normalized books, trades, metadata, and gap logs under the
+chosen data directory. Add `--poll-resolutions` to record outcomes as they
+become available. Omit `--duration` to keep collecting until you stop it.
+
+You can also select groups using `--kalshi-series`,
+`--polymarket-series`, or `--polymarket-tag`. Use the current identifiers
+for the groups you want. Harvest requires a selection; it doesn't subscribe
+to every active market by default.
+
+## Check a recording
+
+```bash
+uv run heurism harvest-status --data-dir data/my-market
+```
+
+Check that frame timestamps stay recent and that book or trade files
+appear under `raw/`. A folder containing only metadata and gap logs doesn't
+mean market data is arriving.
+
+Use separate data directories for separate collection jobs. You can also
+set a custom heartbeat path with `--status-file`; pass the same path to
+`harvest-status`. To combine small files in closed Parquet partitions:
+
+```bash
+uv run heurism compact --data-dir data/my-market
+```
+
+The [strategy guide](strategy-development.md#use-recorded-data) explains
+how to replay these files.
+
+## Match contracts across venues
+
+The cross-venue model compares contracts for the same outcome. Similar
+titles aren't enough: check the event, threshold, resolution time and time
+zone, settlement source, and rules for ties, cancellations, or voids.
+
+Record verified pairs in a JSONL file, one JSON object per line. This shows
+the format; replace the placeholder IDs and conditions before using it:
+
+```jsonl
+{"polymarket_condition_id":"YOUR_CONDITION_ID","polymarket_asset_id":"YOUR_YES_TOKEN_ID","kalshi_ticker":"YOUR_KALSHI_TICKER","polymarket_yes_payout_condition":"The same verified outcome","kalshi_yes_payout_condition":"The same verified outcome","invert":false,"rationale":"Checked both venues' event, timing, settlement source, and rules"}
+```
+
+`polymarket_asset_id` is the YES token. You can also provide
+`polymarket_no_asset_id` if you have the NO token.
+
+Use the same payout description when both YES contracts pay on the same
+outcome. If their outcomes are exact opposites, describe each one and set
+`invert` to `true`; the model then uses `1 - p_kalshi`. The loader checks
+these descriptions for consistency, but it cannot verify the venue rules
+for you. For example, a team's NO outcome may include both a draw and an
+opponent win, so it isn't automatically equivalent to the opponent's YES.
+
+## Run the cross-venue collector
 
 ```bash
 uv run heurism run-collector --allowlist path/to/verified_pairs.jsonl
-```
-
-The collector records Polymarket and Kalshi market data, cross-venue signal
-forecasts, gap logs, status heartbeats, and resolved outcomes. It never places
-orders.
-
-Check freshness and heartbeat state:
-
-```bash
 uv run heurism status
 ```
 
-## Evaluation
+The collector records both venues, the model's forecasts, and resolved
+outcomes. It also includes World Cup-specific discovery at startup and on
+a timer, so its subscriptions can grow beyond the supplied allowlist. Use
+`harvest` when you want to collect only the markets you select.
 
-Produce a WP-4 preliminary edge read from recorded raw books and resolutions:
+## Evaluate forecasts
 
-```bash
-uv run heurism eval --data-dir data --report out.json
-```
-
-For large archives, score a bounded window:
-
-```bash
-uv run heurism eval --data-dir data --report out.json --hours 6
-```
-
-The eval runner replays `data/raw/book` through the current cross-venue signal
-code and joins the recomputed p-hat series to `data/resolutions`. It does not
-read `data/signals`, because that history can mix model versions. The JSON
-report is immutable, includes a config hash, raw data time range, clustered
-proper-score metrics, calibration/ECE, explicit guard counts, and a loud
-`small_n` flag when the number of distinct resolved matches is below the
-configured verdict threshold.
-
-By default the runner uses `pairs.draft.jsonl` as the verified pair mapping.
-Override it with `--allowlist path/to/pairs.jsonl`. Regression fitting is off by
-default; `--fit-regression` will only fit once the configured minimum number of
-distinct resolved events is available.
-
-## Raw Harvest Mode
-
-Use `pmbot harvest` for generic single-venue raw dataset building. Harvest mode
-records normalized order books, trades, gap logs, metadata, and optional
-resolved outcomes under `data/raw/`, but it does not construct cross-venue
-pairs, run contract mapping or resolution-criteria verification, compute
-signals, place orders, or touch execution paths.
-
-Select targeted markets explicitly:
+Once you have books and resolved outcomes, run:
 
 ```bash
-uv run heurism harvest \
-  --polymarket-markets path/to/polymarket_ids.txt \
-  --kalshi-tickers path/to/kalshi_tickers.txt \
-  --duration 300
+uv run heurism eval --data-dir data --allowlist path/to/verified_pairs.jsonl --report reports/forecast-eval.json
 ```
 
-Each Polymarket list row may contain condition IDs or numeric CLOB token/asset
-IDs. Each Kalshi list row contains market tickers. Blank lines and `#` comments
-are ignored, and comma-separated identifiers are accepted.
+The evaluator rebuilds forecasts from `raw/book` and joins them to
+`resolutions`. It doesn't use saved `signals`, which may have been produced
+by older model versions.
 
-You can also harvest targeted groups:
+The report includes forecast scores, calibration, event counts, excluded
+observations, and the configuration used. A `small_n` flag marks runs with
+too few distinct resolved events for a verdict; the default threshold is
+30. Multiple ticks from one event aren't independent outcomes.
 
-```bash
-uv run heurism harvest \
-  --kalshi-series KXWCGAME \
-  --polymarket-series soccer-fifwc \
-  --data-dir data/harvest_wc \
-  --status-file data/harvest_wc/status.json \
-  --poll-resolutions
-```
+Regression fitting is off by default. `--fit-regression` enables it once
+enough distinct events are available. Some defaults are specific to the
+original World Cup experiment, including three-way outcome checks and a
+knockout-stage filter. Review `uv run heurism eval --help` before using the
+model on other markets.
 
-Check the separate harvest heartbeat with:
+To limit a run to the most recent six hours, add `--hours 6`. For older
+recordings, also set `--end-ns` to a timestamp within the recording; otherwise
+the window ends at the current time. Choose a new report filename for
+each run.
 
-```bash
-uv run heurism harvest-status --data-dir data/harvest_wc --status-file data/harvest_wc/status.json
-```
+## Longer runs on macOS
 
-Harvest runs can use a different `--data-dir` and `--status-file` from the
-strategy collector, so both processes can run independently without clobbering
-each other's `status.json`.
-
-There is intentionally no default "all active markets" harvest. Subscribing to
-thousands of live markets can hit websocket and connection limits and flood
-disk. Prefer explicit lists, venue series, or Polymarket tag/series slugs. If an
-all-active mode is added later, it should batch subscriptions and warn loudly.
-
-## Run 24/7 On macOS
-
-The launchd template lives at `ops/launchd/com.pmbot.collector.plist`. Replace
-`__PROJECT_DIR__` and `__ALLOWLIST_PATH__` with absolute paths, and adjust the
-`uv` path if the target Mac does not use `/opt/homebrew/bin/uv`, then install it:
-
-```bash
-mkdir -p data/collector
-cp ops/launchd/com.pmbot.collector.plist ~/Library/LaunchAgents/com.pmbot.collector.plist
-launchctl load ~/Library/LaunchAgents/com.pmbot.collector.plist
-launchctl start com.pmbot.collector
-```
-
-The plist runs the collector under `caffeinate -i` and sets `KeepAlive=true`, so
-launchd restarts it after crashes and reboots. Keep the MacBook plugged in,
-disable system sleep in Battery settings, and prevent lid-close sleep if the
-machine will run closed. For a manual foreground run, use:
+To keep a foreground collector running while preventing idle sleep:
 
 ```bash
 caffeinate -i uv run heurism run-collector --allowlist path/to/verified_pairs.jsonl
 ```
+
+For a background job, the [launchd template](../ops/launchd/com.pmbot.collector.plist)
+sets up automatic restarts and log files. Replace `__PROJECT_DIR__` and
+`__ALLOWLIST_PATH__` with absolute paths, check the path to `uv`, and create
+`data/collector` for the logs before installing it.
